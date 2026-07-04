@@ -1,0 +1,48 @@
+provider: "openrouter" # "openrouter" or "opencode"
+
+openrouter:
+  api_base: "https://openrouter.ai/api/v1"
+  api_key: "" # Put your OpenRouter API key here (optional, falls back to environment variable)
+
+opencode:
+  api_base: "https://opencode.ai/zen/go/v1"
+  api_key: "" # Put your OpenCode API key here (optional, falls back to environment variable)
+
+routing:
+  default_model: "qwen/qwen3.7-max"
+  classifier_model: "qwen/qwen-2.5-7b-instruct"
+  enable_semantic_classification: true # If false, uses regex rules only
+  port: 8005
+
+# Pricing rates per million tokens in USD (approximate rates for cost reporting)
+pricing:
+  "deepseek/deepseek-v4-pro": {prompt: 0.28, completion: 0.28}
+  "qwen/qwen-2.5-coder-32b-instruct": {prompt: 0.07, completion: 0.07}
+  "z-ai/glm-5.2": {prompt: 1.40, completion: 1.40}
+  "moonshotai/kimi-k2.7-code": {prompt: 0.61, completion: 3.07}
+  "minimax/minimax-m3": {prompt: 0.30, completion: 0.30}
+  "qwen/qwen3.7-max": {prompt: 1.20, completion: 1.20}
+  "qwen/qwen-2.5-72b-instruct": {prompt: 0.40, completion: 0.40}
+  "qwen/qwen-2.5-7b-instruct": {prompt: 0.07, completion: 0.07}
+
+categories:
+  coding:
+    primary: "deepseek/deepseek-v4-pro"
+    fallbacks: ["deepseek/deepseek-v4-pro", "qwen/qwen-2.5-coder-32b-instruct"]
+    keywords: ["code", "bug", "import", "class ", "def ", "function", "compile", "python", "javascript", "typescript", "rust", "c++", "git", "syntax", "sql", "database"]
+  design:
+    primary: "z-ai/glm-5.2"
+    fallbacks: ["z-ai/glm-5.2", "qwen/qwen-2.5-72b-instruct"]
+    keywords: ["html", "css", "svg", "ui", "ux", "design", "tailwind", "flexbox", "grid", "border", "padding", "margin", "color palette", "animation", "glassmorphism"]
+  agents:
+    primary: "moonshotai/kimi-k2.7-code"
+    fallbacks: ["moonshotai/kimi-k2.7-code", "qwen/qwen-2.5-72b-instruct"]
+    keywords: ["tool", "agent", "function calling", "execute", "sequence", "automation", "workflow", "run task"]
+  reasoning:
+    primary: "minimax/minimax-m3"
+    fallbacks: ["minimax/minimax-m3", "qwen/qwen-2.5-72b-instruct"]
+    keywords: ["math", "prove", "logic", "reasoning", "GPQA", "gpqa", "probability", "theorem", "calculate"]
+  general:
+    primary: "qwen/qwen3.7-max"
+    fallbacks: ["qwen/qwen3.7-max", "qwen/qwen-2.5-72b-instruct"]
+    keywords: []
