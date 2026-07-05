@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import time
+import html
 from typing import Dict, List, Any, Optional, Generator, Tuple
 
 # In-memory lookup cache with sliding expiration
@@ -166,6 +167,104 @@ def map_chunk_tool_calls(chunk: dict, mapper: ToolCallIndexMapper) -> dict:
                             mapped_idx = mapper.map_index(incoming_idx, has_id)
                             tool_call["index"] = mapped_idx
     return chunk
+
+class XMLToJSONStreamParser:
+    """Parses streaming raw XML tool calls and repackages them as standard JSON tool_calls on the fly."""
+    def __init__(self):
+        self.buffer = ""
+        self.in_xml_mode = False
+        self.tool_call_index = 0
+
+    def feed(self, text: str) -> List[dict]:
+        """Feeds a text chunk and returns a list of OpenAI delta chunks (either content or tool_calls)."""
+        self.buffer += text
+        chunks = []
+
+        while True:
+            if not self.in_xml_mode:
+                # Find if any XML tool call tags start
+                idx_func = self.buffer.find("<function_calls>")
+                idx_invoke = self.buffer.find("<invoke")
+                
+                # Determine which tag starts first
+                indices = [i for i in [idx_func, idx_invoke] if i != -1]
+                if not indices:
+                    # No XML tag started, yield all current buffer
+                    if self.buffer:
+                        chunks.append({"content": self.buffer})
+                        self.buffer = ""
+                    break
+                else:
+                    start_idx = min(indices)
+                    # Yield everything before the start of the XML tag as normal content
+                    if start_idx > 0:
+                        chunks.append({"content": self.buffer[:start_idx]})
+                        self.buffer = self.buffer[start_idx:]
+                    self.in_xml_mode = True
+            else:
+                # We are in XML mode. Look for closed invoke tags.
+                # Find all complete invoke blocks
+                match = re.search(r'<invoke\s+name="([^"]+)"\s*>(.*?)</invoke>', self.buffer, re.DOTALL)
+                if match:
+                    tool_name = match.group(1)
+                    inner_xml = match.group(2)
+                    
+                    # Extract parameters
+                    params = re.findall(r'<([a-zA-Z0-9_]+)>(.*?)</\1>', inner_xml, re.DOTALL)
+                    params_dict = {}
+                    for param_name, param_val in params:
+                        # Clean up value and unescape XML entities
+                        clean_val = html.unescape(param_val.strip())
+                        # Attempt to parse numbers/booleans/JSON arrays/dicts if applicable, otherwise keep as string
+                        if clean_val.lower() == "true":
+                            params_dict[param_name] = True
+                        elif clean_val.lower() == "false":
+                            params_dict[param_name] = False
+                        else:
+                            try:
+                                # Try parsing as number
+                                if "." in clean_val:
+                                    params_dict[param_name] = float(clean_val)
+                                else:
+                                    params_dict[param_name] = int(clean_val)
+                            except ValueError:
+                                try:
+                                    # Try parsing as JSON array/object
+                                    params_dict[param_name] = json.loads(clean_val)
+                                except Exception:
+                                    params_dict[param_name] = clean_val
+                    
+                    # Create tool call dict
+                    tool_call = {
+                        "index": self.tool_call_index,
+                        "id": f"call_xml_{self.tool_call_index}",
+                        "type": "function",
+                        "function": {
+                            "name": tool_name,
+                            "arguments": json.dumps(params_dict)
+                        }
+                    }
+                    self.tool_call_index += 1
+                    
+                    chunks.append({"tool_calls": [tool_call]})
+                    
+                    # Remove the parsed invoke tag from the buffer
+                    end_pos = match.end()
+                    self.buffer = self.buffer[end_pos:]
+                    continue
+                
+                # Check if we see the end of function_calls block
+                idx_end_func = self.buffer.find("</function_calls>")
+                if idx_end_func != -1:
+                    # Remove the closing tag and exit XML mode
+                    self.buffer = self.buffer[idx_end_func + len("</function_calls>"):]
+                    self.in_xml_mode = False
+                    continue
+                
+                # If we are in XML mode but have no complete invoke tag yet, do not yield anything (buffering)
+                break
+
+        return chunks
 
 def classify_by_keywords(text: str) -> Optional[str]:
     """Classifies a query based on keyword counts defined in config.yaml."""
@@ -464,6 +563,7 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
         prompt_tokens = 0
         completion_tokens = 0
         mapper = ToolCallIndexMapper()
+        xml_parser = XMLToJSONStreamParser()
         has_thinking = False
         
         async for line in response.aiter_lines():
@@ -473,6 +573,16 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
             if line.startswith("data:"):
                 data_str = line[5:].strip()
                 if data_str == "[DONE]":
+                    if xml_parser.buffer:
+                        flush_chunk = {
+                            "choices": [{
+                                "delta": {
+                                    "content": xml_parser.buffer
+                                }
+                            }]
+                        }
+                        yield f"data: {json.dumps(flush_chunk)}\n\n".encode("utf-8")
+                        xml_parser.buffer = ""
                     if has_thinking:
                         # Close the thinking tag before sending [DONE]
                         close_chunk = {
@@ -503,16 +613,47 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
                                 delta["content"] = f"<think>\n{reasoning}"
                             else:
                                 delta["content"] = reasoning
-                        elif has_thinking and content:
-                            has_thinking = False
-                            delta["content"] = f"\n</think>\n\n{content}"
+                            yield f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
+                        else:
+                            if has_thinking and content:
+                                has_thinking = False
+                                content = f"\n</think>\n\n{content}"
                             
+                            if content:
+                                parsed_items = xml_parser.feed(content)
+                                for item in parsed_items:
+                                    new_chunk = {
+                                        "id": chunk.get("id", ""),
+                                        "object": chunk.get("object", ""),
+                                        "created": chunk.get("created", 0),
+                                        "model": chunk.get("model", ""),
+                                        "choices": [
+                                            {
+                                                "index": 0,
+                                                "delta": {}
+                                            }
+                                        ]
+                                    }
+                                    if "content" in item:
+                                        new_chunk["choices"][0]["delta"]["content"] = item["content"]
+                                    elif "tool_calls" in item:
+                                        new_chunk["choices"][0]["delta"]["tool_calls"] = item["tool_calls"]
+                                        
+                                    if "model" in chunk:
+                                        new_chunk["model"] = chunk["model"]
+                                    if "usage" in chunk:
+                                        new_chunk["usage"] = chunk["usage"]
+                                    yield f"data: {json.dumps(new_chunk)}\n\n".encode("utf-8")
+                            else:
+                                yield f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
+                    else:
+                        yield f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
+                        
                     if "model" in chunk:
                         actual_model = chunk["model"]
                     if "usage" in chunk and chunk["usage"]:
                         prompt_tokens = chunk["usage"].get("prompt_tokens", 0)
                         completion_tokens = chunk["usage"].get("completion_tokens", 0)
-                    yield f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
                 except Exception:
                     yield f"{line}\n".encode("utf-8")
             else:
@@ -552,15 +693,65 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
             response_json = sanitize_json(response_json)
             actual_model = response_json.get("model", actual_primary)
             
-            # Map reasoning_content in non-streaming responses
+            # Map reasoning_content and XML tool calls in non-streaming responses
             if "choices" in response_json and response_json["choices"]:
                 message = response_json["choices"][0].get("message", {})
                 reasoning = message.get("reasoning_content") or message.get("reasoning")
                 content = message.get("content", "")
                 if reasoning and content:
-                    message["content"] = f"<think>\n{reasoning}\n</think>\n\n{content}"
+                    content = f"<think>\n{reasoning}\n</think>\n\n{content}"
                 elif reasoning:
-                    message["content"] = f"<think>\n{reasoning}\n</think>\n\n"
+                    content = f"<think>\n{reasoning}\n</think>\n\n"
+                
+                # Check for XML tool calls in content
+                if content and ("<invoke" in content or "<function_calls>" in content):
+                    tool_calls = []
+                    # Find all invoke blocks
+                    invokes = re.finditer(r'<invoke\s+name="([^"]+)"\s*>(.*?)</invoke>', content, re.DOTALL)
+                    tool_call_index = 0
+                    for match in invokes:
+                        tool_name = match.group(1)
+                        inner_xml = match.group(2)
+                        
+                        # Extract parameters
+                        params = re.findall(r'<([a-zA-Z0-9_]+)>(.*?)</\1>', inner_xml, re.DOTALL)
+                        params_dict = {}
+                        for param_name, param_val in params:
+                            clean_val = html.unescape(param_val.strip())
+                            if clean_val.lower() == "true":
+                                params_dict[param_name] = True
+                            elif clean_val.lower() == "false":
+                                params_dict[param_name] = False
+                            else:
+                                try:
+                                    if "." in clean_val:
+                                        params_dict[param_name] = float(clean_val)
+                                    else:
+                                        params_dict[param_name] = int(clean_val)
+                                except ValueError:
+                                    try:
+                                        params_dict[param_name] = json.loads(clean_val)
+                                    except Exception:
+                                        params_dict[param_name] = clean_val
+                        
+                        tool_calls.append({
+                            "id": f"call_xml_{tool_call_index}",
+                            "type": "function",
+                            "function": {
+                                "name": tool_name,
+                                "arguments": json.dumps(params_dict)
+                            }
+                        })
+                        tool_call_index += 1
+                    
+                    if tool_calls:
+                        message["tool_calls"] = tool_calls
+                        # Remove the XML block from content
+                        clean_content = re.sub(r'<function_calls>.*?</function_calls>', '', content, flags=re.DOTALL)
+                        clean_content = re.sub(r'<invoke.*?</invoke>', '', clean_content, flags=re.DOTALL)
+                        content = clean_content.strip()
+                
+                message["content"] = content or None
                     
             usage = response_json.get("usage", {})
             prompt_tokens = usage.get("prompt_tokens", 0)
