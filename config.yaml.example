@@ -13,6 +13,8 @@ routing:
   classifier_model: "qwen/qwen-2.5-7b-instruct"
   enable_semantic_classification: true # If false, uses regex rules only
   port: 8005
+  enable_response_caching: true # Bypasses cost/time for identical requests
+  enable_prompt_caching: true # Enforce KV caching for Claude models
 
 # Pricing rates per million tokens in USD (approximate rates for cost reporting)
 pricing:

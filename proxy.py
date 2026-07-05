@@ -457,7 +457,12 @@ async def forward_request_with_failover(
     """Forwards the request using native server fallbacks (OpenRouter) or client-side retry loop (OpenCode)."""
     if PROVIDER == "openrouter":
         # OpenRouter supports native model list parameter
-        body["model"] = fallback_models[0]
+        active_model = fallback_models[0]
+        if not ("claude" in active_model.lower() or "anthropic" in active_model.lower()):
+            body = body.copy()
+            body["messages"] = strip_prompt_caching(body.get("messages", []))
+            
+        body["model"] = active_model
         body["models"] = fallback_models
         
         req = client.build_request("POST", f"{api_base}/chat/completions", headers=headers, json=body)
@@ -475,6 +480,8 @@ async def forward_request_with_failover(
     last_error = ""
     for model in fallback_models:
         payload = body.copy()
+        # Always strip cache_control when calling OpenCode Go
+        payload["messages"] = strip_prompt_caching(payload.get("messages", []))
         payload["model"] = map_model_for_provider(model)
         # Strip OpenRouter custom parameters
         if "models" in payload:
@@ -500,6 +507,96 @@ async def forward_request_with_failover(
         status_code=502,
         detail=f"All models in the fallback chain failed on provider {PROVIDER}. Last error: {last_error}"
     )
+
+def add_cache_control_to_message(message: dict) -> dict:
+    """Helper to inject cache_control parameter into a message's content block."""
+    content = message.get("content")
+    if not content:
+        return message
+        
+    new_msg = {k: v for k, v in message.items()}
+    
+    if isinstance(content, str):
+        # Convert string content to content block list with cache_control
+        new_msg["content"] = [
+            {
+                "type": "text",
+                "text": content,
+                "cache_control": {"type": "ephemeral"}
+            }
+        ]
+    elif isinstance(content, list):
+        # If it's already a list of blocks, add cache_control to the last block
+        if content:
+            new_list = []
+            for block in content:
+                if isinstance(block, dict):
+                    new_list.append({k: v for k, v in block.items()})
+                else:
+                    new_list.append(block)
+            # Add cache_control to the last block
+            if isinstance(new_list[-1], dict):
+                new_list[-1]["cache_control"] = {"type": "ephemeral"}
+            new_msg["content"] = new_list
+            
+    return new_msg
+
+def inject_prompt_caching(messages: List[dict]) -> List[dict]:
+    """Injects Anthropic-style cache_control breakpoints to maximize KV caching efficiency."""
+    if not messages:
+        return messages
+        
+    new_messages = []
+    for msg in messages:
+        new_msg = {k: v for k, v in msg.items()}
+        new_messages.append(new_msg)
+        
+    # Set cache control breakpoints (up to 4 allowed by Anthropic):
+    # 1. The system prompt (index 0 if role is 'system', otherwise the first user message)
+    # 2. The message at index N-2 (usually the last assistant response, to cache the entire history prefix)
+    if new_messages[0].get("role") == "system":
+        new_messages[0] = add_cache_control_to_message(new_messages[0])
+    else:
+        new_messages[0] = add_cache_control_to_message(new_messages[0])
+        
+    N = len(new_messages)
+    if N >= 3:
+        new_messages[N-2] = add_cache_control_to_message(new_messages[N-2])
+        
+    return new_messages
+
+def strip_prompt_caching(messages: List[dict]) -> List[dict]:
+    """Strips any cache_control annotations from message content blocks to avoid API errors on unsupported models."""
+    if not messages:
+        return messages
+    
+    clean_messages = []
+    for msg in messages:
+        new_msg = {k: v for k, v in msg.items()}
+        content = new_msg.get("content")
+        if isinstance(content, list):
+            new_list = []
+            has_only_text = True
+            text_acc = []
+            for block in content:
+                if isinstance(block, dict):
+                    clean_block = {k: v for k, v in block.items() if k != "cache_control"}
+                    new_list.append(clean_block)
+                    if block.get("type") == "text" and len(block) <= 3: # type, text, cache_control
+                        text_acc.append(block.get("text", ""))
+                    else:
+                        has_only_text = False
+                else:
+                    new_list.append(block)
+                    has_only_text = False
+            
+            # If the block list was just text blocks and we stripped cache_control, convert back to a clean simple string
+            if has_only_text and text_acc:
+                new_msg["content"] = "".join(text_acc)
+            else:
+                new_msg["content"] = new_list
+        clean_messages.append(new_msg)
+    return clean_messages
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request, authorization: Optional[str] = Header(None)):
@@ -551,12 +648,22 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
     if not api_base:
         api_base = "https://openrouter.ai/api/v1" if PROVIDER == "openrouter" else "https://opencode.ai/zen/go/v1"
         
+    enable_response_caching = config.get("routing", {}).get("enable_response_caching", True)
+    enable_prompt_caching = config.get("routing", {}).get("enable_prompt_caching", True)
+
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
         "HTTP-Referer": LOCAL_URL,
         "X-Title": "Chinese LLM Router Gateway"
     }
+    
+    if PROVIDER == "openrouter" and enable_response_caching:
+        headers["X-OpenRouter-Cache"] = "true"
+
+    if PROVIDER == "openrouter" and enable_prompt_caching:
+        if "claude" in primary_model.lower() or "anthropic" in primary_model.lower():
+            body["messages"] = inject_prompt_caching(messages)
     
     async def stream_generator(response: httpx.Response, selected_model: str) -> Generator[bytes, None, None]:
         actual_model = selected_model
