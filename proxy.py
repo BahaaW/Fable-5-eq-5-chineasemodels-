@@ -394,6 +394,20 @@ async def classify_semantically(query: str, api_key: str, client: httpx.AsyncCli
         
     return "general"
 
+def messages_contain_images(messages: List[Dict[str, Any]]) -> bool:
+    """Detect whether any message in the conversation contains an image content block."""
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    btype = block.get("type")
+                    if btype in ("image_url", "image"):
+                        return True
+    return False
+
 async def determine_category(messages: List[Dict[str, Any]], api_key: Optional[str], client: httpx.AsyncClient) -> str:
     text_to_classify = ""
     for msg in messages[-3:]:
@@ -501,6 +515,65 @@ async def list_models(request: Request, authorization: Optional[str] = Header(No
     result = {"object": "list", "data": virtual_models}
     return JSONResponse(content=result)
 
+def strip_unsupported_content_blocks(payload: dict, model_lower: str, allowed_types: set) -> dict:
+    """Remove content blocks whose type is not in allowed_types for a given model.
+    
+    Some providers (e.g. DeepSeek) only accept `text` content blocks and reject
+    `image_url` / `image` blocks with a 400. We strip unsupported blocks and
+    insert a text placeholder so the model knows an image was present.
+    """
+    messages = payload.get("messages", [])
+    if not messages:
+        return payload
+
+    changed = False
+    new_messages = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            new_messages.append(msg)
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            new_messages.append(msg)
+            continue
+
+        new_blocks = []
+        msg_changed = False
+        for block in content:
+            if not isinstance(block, dict):
+                new_blocks.append(block)
+                continue
+            btype = block.get("type")
+            if btype in allowed_types:
+                new_blocks.append(block)
+            else:
+                msg_changed = True
+                # Replace unsupported block with a text placeholder
+                if btype == "image_url":
+                    placeholder = "[image attached - not supported by this model]"
+                elif btype == "image":
+                    placeholder = "[image attached - not supported by this model]"
+                elif btype == "input_audio":
+                    placeholder = "[audio attached - not supported by this model]"
+                else:
+                    placeholder = f"[{btype} content - not supported by this model]"
+                new_blocks.append({"type": "text", "text": placeholder})
+
+        if msg_changed:
+            changed = True
+            new_msg = {k: v for k, v in msg.items()}
+            new_msg["content"] = new_blocks
+            new_messages.append(new_msg)
+        else:
+            new_messages.append(msg)
+
+    if not changed:
+        return payload
+    payload = payload.copy()
+    payload["messages"] = new_messages
+    return payload
+
+
 def sanitize_payload_for_model(payload: dict, model: str) -> dict:
     """Apply per-model parameter fixes required by upstream providers.
     
@@ -534,6 +607,10 @@ def sanitize_payload_for_model(payload: dict, model: str) -> dict:
             # so we use the object form {"type": "disabled"} and also set enable_thinking=false.
             payload["enable_thinking"] = False
             payload["thinking"] = {"type": "disabled"}
+
+        # DeepSeek does not support image_url content blocks (only text).
+        # Strip image blocks and replace with a text placeholder so the request is accepted.
+        payload = strip_unsupported_content_blocks(payload, model_lower, allowed_types={"text"})
 
     # MiniMax M3 is served via the Anthropic SDK, which enforces strict parameter
     # constraints that OpenAI/OpenRouter clients routinely violate:
@@ -804,10 +881,20 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
     client = get_http_client(request)
     
     if should_route:
-        category = await determine_category(messages, api_key, client)
-        cat_config = config.get("categories", {}).get(category, {})
-        primary_model = cat_config.get("primary", config["routing"]["default_model"])
-        fallback_models = cat_config.get("fallbacks", [primary_model])
+        # Image detection: if the conversation contains image content blocks,
+        # route to a vision-capable model (qwen3.7-max) regardless of category,
+        # since most of the fleet is text-only and would 400 on image_url.
+        if messages_contain_images(messages):
+            vision_model = config.get("routing", {}).get("vision_model", "qwen/qwen3.7-max")
+            category = "vision"
+            primary_model = vision_model
+            fallback_models = [vision_model, config["routing"]["default_model"]]
+            logger.info(f"Image content detected -> routing to vision model: {vision_model}")
+        else:
+            category = await determine_category(messages, api_key, client)
+            cat_config = config.get("categories", {}).get(category, {})
+            primary_model = cat_config.get("primary", config["routing"]["default_model"])
+            fallback_models = cat_config.get("fallbacks", [primary_model])
     else:
         category = "explicit"
         primary_model = requested_model
@@ -816,6 +903,15 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
             fallback_models = config["categories"][matched_cat].get("fallbacks", [primary_model])
         else:
             fallback_models = [primary_model, config["routing"]["default_model"]]
+
+    # OpenCode gateway does not pass through image content blocks for any model
+    # (even Qwen-VL lineage). Strip image blocks and replace with a text placeholder
+    # so the request is accepted instead of 400-ing with "Unexpected item type in content."
+    if PROVIDER == "opencode" and messages_contain_images(body.get("messages", [])):
+        stripped = strip_unsupported_content_blocks({"messages": body.get("messages", [])}, "all", {"text"})
+        body = body.copy()
+        body["messages"] = stripped["messages"]
+        logger.info("Stripped image content blocks (OpenCode gateway does not support image passthrough).")
             
     api_base = config.get(PROVIDER, {}).get("api_base")
     if not api_base:
