@@ -990,19 +990,13 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
                                 delta["content"] = "<thinking>\n" + reasoning
                             else:
                                 delta["content"] = reasoning
-                            # Remove the raw reasoning fields to avoid confusing clients
+                            # Remove the raw reasoning fields when mapping to content
                             delta.pop("reasoning_content", None)
                             delta.pop("reasoning", None)
                             yield f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
                         elif reasoning:
-                            # Thinking mapping disabled: strip reasoning fields entirely.
-                            # Many clients (e.g. Copilot) don't understand reasoning_content and will
-                            # loop or replay the same response waiting for real content.
-                            delta.pop("reasoning_content", None)
-                            delta.pop("reasoning", None)
-                            # If there's no real content in this delta, skip emitting it
-                            if not delta.get("content"):
-                                continue
+                            # Thinking mapping disabled: pass reasoning_content through unchanged.
+                            # Clients like Copilot render it in a dedicated thinking UI.
                             yield f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
                         else:
                             if has_thinking and content and enable_thinking_mapping:
