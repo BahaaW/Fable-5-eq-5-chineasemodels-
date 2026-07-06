@@ -85,7 +85,48 @@ def test_xml_to_json_parser():
     assert args["arg"] == "some value"
     print("Test Case 5 Passed!")
 
-    print("\nALL XML-TO-JSON PARSER UNIT TESTS PASSED SUCCESSFULLY!")
+    # Test Case 6: Flexible regex matching (single quotes, spaces around name, etc.)
+    parser = XMLToJSONStreamParser()
+    chunks = parser.feed(
+        "<function_calls>\n"
+        "  <invoke name  =  'flexible_tool'>\n"
+        "    <data>success</data>\n"
+        "  </invoke>\n"
+        "</function_calls>"
+    )
+    tool_calls = [c["tool_calls"][0] for c in chunks if "tool_calls" in c]
+    assert len(tool_calls) == 1
+    assert tool_calls[0]["function"]["name"] == "flexible_tool"
+    args = json.loads(tool_calls[0]["function"]["arguments"])
+    assert args["data"] == "success"
+    print("Test Case 6 (Flexible Regex Parsing) Passed!")
+
+    # Test Case 7: inject_reminder system prompt modifier
+    from proxy import inject_reminder
+    
+    # Message history with system prompt
+    messages_with_sys = [
+        {"role": "system", "content": "Initial system instruction."},
+        {"role": "user", "content": "How do I do X?"}
+    ]
+    modified_sys = inject_reminder(messages_with_sys)
+    assert len(modified_sys) == 2
+    assert modified_sys[0]["role"] == "system"
+    assert "CRITICAL CONSTRAINT" in modified_sys[0]["content"]
+    assert "Initial system instruction." in modified_sys[0]["content"]
+    
+    # Message history without system prompt (should insert one)
+    messages_no_sys = [
+        {"role": "user", "content": "How do I do Y?"}
+    ]
+    modified_no_sys = inject_reminder(messages_no_sys)
+    assert len(modified_no_sys) == 2
+    assert modified_no_sys[0]["role"] == "system"
+    assert "CRITICAL CONSTRAINT" in modified_no_sys[0]["content"]
+    assert modified_no_sys[1]["role"] == "user"
+    print("Test Case 7 (inject_reminder) Passed!")
+
+    print("\nALL XML-TO-JSON PARSER & SYSTEM REMINDER UNIT TESTS PASSED SUCCESSFULLY!")
 
 if __name__ == "__main__":
     test_xml_to_json_parser()

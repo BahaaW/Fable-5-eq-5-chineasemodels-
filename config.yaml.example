@@ -15,6 +15,7 @@ routing:
   port: 8005
   enable_response_caching: true # Bypasses cost/time for identical requests
   enable_prompt_caching: true # Enforce KV caching for Claude models
+  enable_system_reminder: true # Appends strict tool-calling reminders to the system prompt
 
 # Pricing rates per million tokens in USD (approximate rates for cost reporting)
 pricing:

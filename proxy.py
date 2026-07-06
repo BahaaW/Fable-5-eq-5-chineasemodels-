@@ -25,8 +25,8 @@ logger = logging.getLogger("ChineseRouter")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Enable HTTP/2 and set 3-minute timeout limit for connection pool reuse
-    app.state.client = httpx.AsyncClient(timeout=180.0, http2=True)
+    # Enable HTTP/2 and set 5-minute timeout limit for connection pool reuse
+    app.state.client = httpx.AsyncClient(timeout=300.0, http2=True)
     yield
     await app.state.client.aclose()
 
@@ -248,7 +248,7 @@ class XMLToJSONStreamParser:
             else:
                 # We are in XML mode. Look for closed invoke tags.
                 # Find all complete invoke blocks
-                match = re.search(r'<invoke\s+name="([^"]+)"\s*>(.*?)</invoke>', self.buffer, re.DOTALL)
+                match = re.search(r'<invoke\s+name\s*=\s*["\']([^"\']+)["\']\s*>(.*?)</invoke>', self.buffer, re.DOTALL)
                 if match:
                     tool_name = match.group(1)
                     inner_xml = match.group(2)
@@ -440,7 +440,7 @@ def get_http_client(request: Request) -> httpx.AsyncClient:
     except AttributeError:
         # For testing environments where lifespan events are not executed
         if not hasattr(request.app.state, "_fallback_client"):
-            request.app.state._fallback_client = httpx.AsyncClient(timeout=180.0, http2=True)
+            request.app.state._fallback_client = httpx.AsyncClient(timeout=300.0, http2=True)
         return request.app.state._fallback_client
 
 @app.get("/v1/models")
@@ -568,6 +568,46 @@ async def forward_request_with_failover(
         detail=f"All models in the fallback chain failed on provider {PROVIDER}. Last error: {last_error}"
     )
 
+def inject_reminder(messages: List[dict]) -> List[dict]:
+    """Appends a strict system constraint reminding the model to use tool calls instead of raw markdown text blocks for coding tasks."""
+    if not messages:
+        return messages
+
+    reminder_text = (
+        "\n\nCRITICAL CONSTRAINT: You MUST execute coding changes, file modifications, "
+        "and command executions using the designated tool calls. Do NOT simply display "
+        "raw code inside markdown text blocks unless explicitly instructed. "
+        "Always invoke the relevant tools to make changes."
+    )
+
+    new_messages = []
+    system_updated = False
+    
+    # Try to find the system message and append the constraint
+    for msg in messages:
+        new_msg = {k: v for k, v in msg.items()}
+        if new_msg.get("role") == "system" and not system_updated:
+            content = new_msg.get("content", "")
+            if isinstance(content, str):
+                new_msg["content"] = content + reminder_text
+            elif isinstance(content, list):
+                # Append to the last text block or add a new one
+                if content and isinstance(content[-1], dict) and content[-1].get("type") == "text":
+                    content[-1]["text"] = content[-1].get("text", "") + reminder_text
+                else:
+                    content.append({"type": "text", "text": reminder_text})
+            system_updated = True
+        new_messages.append(new_msg)
+
+    # If no system message was found, prepend a new system message with the constraint
+    if not system_updated:
+        new_messages.insert(0, {
+            "role": "system",
+            "content": reminder_text.strip()
+        })
+
+    return new_messages
+
 def add_cache_control_to_message(message: dict) -> dict:
     """Helper to inject cache_control parameter into a message's content block."""
     content = message.get("content")
@@ -683,6 +723,11 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
     messages = body.get("messages", [])
     requested_model = body.get("model", "")
     stream = body.get("stream", False)
+    
+    enable_system_reminder = config.get("routing", {}).get("enable_system_reminder", True)
+    if enable_system_reminder:
+        messages = inject_reminder(messages)
+        body["messages"] = messages
     
     # Check if request targets auto-routing
     # Automatically routes custom-router, default, empty, or any standard model alias without a '/' slash (like gpt-4o, claude-3-5-sonnet, deepseek-chat)
