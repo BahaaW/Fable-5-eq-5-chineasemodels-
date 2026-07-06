@@ -578,6 +578,7 @@ def inject_reminder(messages: List[dict]) -> List[dict]:
     if not messages:
         return messages
 
+    reminder_prefix = "CRITICAL CONSTRAINT: You MUST execute coding changes"
     reminder_text = (
         "\n\nCRITICAL CONSTRAINT: You MUST execute coding changes, file modifications, "
         "and command executions using the designated tool calls. Do NOT simply display "
@@ -594,13 +595,20 @@ def inject_reminder(messages: List[dict]) -> List[dict]:
         if new_msg.get("role") == "system" and not system_updated:
             content = new_msg.get("content", "")
             if isinstance(content, str):
-                new_msg["content"] = content + reminder_text
+                if reminder_prefix not in content:
+                    new_msg["content"] = content + reminder_text
             elif isinstance(content, list):
                 # Append to the last text block or add a new one
-                if content and isinstance(content[-1], dict) and content[-1].get("type") == "text":
-                    content[-1]["text"] = content[-1].get("text", "") + reminder_text
-                else:
-                    content.append({"type": "text", "text": reminder_text})
+                already_has = False
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text" and reminder_prefix in block.get("text", ""):
+                        already_has = True
+                        break
+                if not already_has:
+                    if content and isinstance(content[-1], dict) and content[-1].get("type") == "text":
+                        content[-1]["text"] = content[-1].get("text", "") + reminder_text
+                    else:
+                        content.append({"type": "text", "text": reminder_text})
             system_updated = True
         new_messages.append(new_msg)
 
@@ -822,21 +830,25 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
                     chunk = sanitize_json(chunk)
                     chunk = map_chunk_tool_calls(chunk, mapper)
                     
-                    # Convert reasoning/thinking tokens to standard content for clients to display
+                    # Convert reasoning/thinking tokens to standard content for clients if enabled
+                    enable_thinking_mapping = config.get("routing", {}).get("enable_thinking_mapping", False)
                     if "choices" in chunk and chunk["choices"]:
                         delta = chunk["choices"][0].get("delta", {})
                         reasoning = delta.get("reasoning_content") or delta.get("reasoning")
                         content = delta.get("content", "")
                         
-                        if reasoning:
+                        if reasoning and enable_thinking_mapping:
                             if not has_thinking:
                                 has_thinking = True
                                 delta["content"] = f"<think>\n{reasoning}"
                             else:
                                 delta["content"] = reasoning
                             yield f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
+                        elif reasoning:
+                            # Keep reasoning in reasoning_content/reasoning only (native client rendering)
+                            yield f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
                         else:
-                            if has_thinking and content:
+                            if has_thinking and content and enable_thinking_mapping:
                                 has_thinking = False
                                 content = f"\n</think>\n\n{content}"
                             
