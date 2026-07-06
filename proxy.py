@@ -363,12 +363,24 @@ async def classify_semantically(query: str, api_key: str, client: httpx.AsyncCli
         "temperature": 0.0,
         "max_tokens": 10
     }
-    
+    # Apply per-model parameter fixes (e.g. kimi temp/top_p restrictions)
+    payload = sanitize_payload_for_model(payload, classifier_model)
+
+    classifier_timeout = config.get("routing", {}).get("classifier_timeout", 15.0)
     try:
-        response = await client.post(f"{api_base}/chat/completions", headers=headers, json=payload, timeout=5.0)
+        response = await client.post(f"{api_base}/chat/completions", headers=headers, json=payload, timeout=classifier_timeout)
         if response.status_code == 200:
             result = response.json()
-            cat = result["choices"][0]["message"]["content"].strip().lower()
+            choices = result.get("choices") or []
+            if not choices:
+                logger.warning(f"LLM Classifier returned no choices: {json.dumps(result)[:300]}")
+                return "general"
+            message = choices[0].get("message", {}) or {}
+            raw_content = message.get("content") or ""
+            if not raw_content:
+                logger.warning(f"LLM Classifier returned empty content: {json.dumps(choices[0])[:300]}")
+                return "general"
+            cat = raw_content.strip().lower()
             cat = re.sub(r'[^\w]', '', cat)
             if cat in config.get("categories", {}):
                 logger.info(f"LLM Classifier selected: '{cat}'")
@@ -376,9 +388,9 @@ async def classify_semantically(query: str, api_key: str, client: httpx.AsyncCli
             else:
                 logger.warning(f"LLM Classifier returned invalid category: '{cat}'")
         else:
-            logger.error(f"LLM Classifier request failed with code {response.status_code}: {response.text}")
+            logger.error(f"LLM Classifier request failed with code {response.status_code}: {response.text[:300]}")
     except Exception as e:
-        logger.error(f"Error calling semantic classifier: {e}")
+        logger.error(f"Error calling semantic classifier: {type(e).__name__}: {e}")
         
     return "general"
 
@@ -415,28 +427,6 @@ def calculate_estimated_cost(model: str, prompt_tokens: int, completion_tokens: 
     p_cost = (prompt_tokens / 1_000_000) * pricing.get("prompt", 0.5)
     c_cost = (completion_tokens / 1_000_000) * pricing.get("completion", 0.5)
     return p_cost + c_cost
-
-def print_transaction_summary(category: str, selected_model: str, actual_model: str, prompt_tokens: int, completion_tokens: int):
-    cost = calculate_estimated_cost(actual_model, prompt_tokens, completion_tokens)
-    total_tokens = prompt_tokens + completion_tokens
-    cost_str = f"${cost:.6f}"
-    
-    summary = (
-        f"\n"
-        f"+-------------------------------------------------------------------------------------------------+\n"
-        f"|                                     TRANSACTION SUMMARY                                         |\n"
-        f"+----------------------+--------------------------------------------------------------------------+\n"
-        f"| Provider             | {PROVIDER.upper():<72} |\n"
-        f"| Category             | {category:<72} |\n"
-        f"| Selected Model       | {selected_model:<72} |\n"
-        f"| Actual Model         | {actual_model:<72} |\n"
-        f"| Prompt Tokens        | {prompt_tokens:<72} |\n"
-        f"| Completion Tokens    | {completion_tokens:<72} |\n"
-        f"| Total Tokens         | {total_tokens:<72} |\n"
-        f"| Estimated Cost       | {cost_str:<72} |\n"
-        f"+----------------------+--------------------------------------------------------------------------+\n"
-    )
-    print(summary)
 
 def get_http_client(request: Request) -> httpx.AsyncClient:
     """Safely retrieves the connection pool client, falling back to a fresh one if lifespan was bypassed (e.g. in tests)."""
@@ -511,6 +501,63 @@ async def list_models(request: Request, authorization: Optional[str] = Header(No
     result = {"object": "list", "data": virtual_models}
     return JSONResponse(content=result)
 
+def sanitize_payload_for_model(payload: dict, model: str) -> dict:
+    """Apply per-model parameter fixes required by upstream providers.
+    
+    Some Chinese providers reject requests that look fine to OpenAI/OpenRouter clients:
+    - Moonshot K2.7 code only accepts temperature=1 (any other value -> 400).
+    - DeepSeek thinking models require reasoning_content to be echoed back in prior
+      assistant turns; if the client stripped it, the API rejects the request with
+      "The reasoning_content in the thinking mode must be passed back to the API."
+      We work around this by disabling the thinking mode for DeepSeek-v4-pro when the
+      conversation history lacks reasoning_content, so the request can still succeed.
+    """
+    model_lower = (model or "").lower()
+
+    # Moonshot K2.7 code: only temperature=1 and top_p=0.95 are allowed
+    if "kimi-k2.7" in model_lower or "kimi-k2-7" in model_lower:
+        payload = payload.copy()
+        payload["temperature"] = 1
+        payload["top_p"] = 0.95
+
+    # DeepSeek thinking models: if reasoning_content is missing from history, disable thinking
+    if "deepseek-v4-pro" in model_lower or "deepseek-v4" in model_lower:
+        messages = payload.get("messages", [])
+        has_reasoning = any(
+            isinstance(m, dict) and m.get("role") == "assistant" and m.get("reasoning_content")
+            for m in messages
+        )
+        if not has_reasoning:
+            payload = payload.copy()
+            # Disable thinking mode so the API does not require reasoning_content echo-back.
+            # DeepSeek expects `thinking` to be a ThinkingOptions struct, not a boolean,
+            # so we use the object form {"type": "disabled"} and also set enable_thinking=false.
+            payload["enable_thinking"] = False
+            payload["thinking"] = {"type": "disabled"}
+
+    # MiniMax M3 is served via the Anthropic SDK, which enforces strict parameter
+    # constraints that OpenAI/OpenRouter clients routinely violate:
+    #   - temperature must be in [0, 1] (clients often send up to 2.0)
+    #   - top_p must be in [0, 1]
+    #   - max_tokens is required (OpenAI clients sometimes omit it)
+    # We clamp/patch these so the request is accepted.
+    if "minimax-m3" in model_lower or "minimax/m3" in model_lower:
+        payload = payload.copy()
+        temp = payload.get("temperature")
+        if isinstance(temp, (int, float)):
+            payload["temperature"] = max(0.0, min(1.0, float(temp)))
+        else:
+            payload["temperature"] = 1.0
+        top_p = payload.get("top_p")
+        if isinstance(top_p, (int, float)):
+            payload["top_p"] = max(0.0, min(1.0, float(top_p)))
+        if not payload.get("max_tokens"):
+            # Anthropic SDK requires max_tokens; default to a sane cap.
+            payload["max_tokens"] = 4096
+
+    return payload
+
+
 async def forward_request_with_failover(
     client: httpx.AsyncClient,
     api_base: str,
@@ -529,6 +576,8 @@ async def forward_request_with_failover(
             
         body["model"] = active_model
         body["models"] = fallback_models
+
+        body = sanitize_payload_for_model(body, active_model)
         
         req = client.build_request("POST", f"{api_base}/chat/completions", headers=headers, json=body)
         r = await client.send(req, stream=stream)
@@ -551,6 +600,8 @@ async def forward_request_with_failover(
         # Strip OpenRouter custom parameters
         if "models" in payload:
             del payload["models"]
+
+        payload = sanitize_payload_for_model(payload, model)
             
         logger.info(f"Forwarding call to {PROVIDER} for model: {model}")
         try:
@@ -817,7 +868,7 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
                         close_chunk = {
                             "choices": [{
                                 "delta": {
-                                    "content": "\n</think>\n\n"
+                                    "content": "\n</thinking>\n\n"
                                 }
                             }]
                         }
@@ -840,17 +891,27 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
                         if reasoning and enable_thinking_mapping:
                             if not has_thinking:
                                 has_thinking = True
-                                delta["content"] = f"<think>\n{reasoning}"
+                                delta["content"] = "<thinking>\n" + reasoning
                             else:
                                 delta["content"] = reasoning
+                            # Remove the raw reasoning fields to avoid confusing clients
+                            delta.pop("reasoning_content", None)
+                            delta.pop("reasoning", None)
                             yield f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
                         elif reasoning:
-                            # Keep reasoning in reasoning_content/reasoning only (native client rendering)
+                            # Thinking mapping disabled: strip reasoning fields entirely.
+                            # Many clients (e.g. Copilot) don't understand reasoning_content and will
+                            # loop or replay the same response waiting for real content.
+                            delta.pop("reasoning_content", None)
+                            delta.pop("reasoning", None)
+                            # If there's no real content in this delta, skip emitting it
+                            if not delta.get("content"):
+                                continue
                             yield f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
                         else:
                             if has_thinking and content and enable_thinking_mapping:
                                 has_thinking = False
-                                content = f"\n</think>\n\n{content}"
+                                content = "\n</thinking>\n\n" + content
                             
                             if content:
                                 parsed_items = xml_parser.feed(content)
@@ -893,7 +954,7 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
                 yield f"{line}\n".encode("utf-8")
                     
         if prompt_tokens > 0 or completion_tokens > 0:
-            print_transaction_summary(category, selected_model, actual_model, prompt_tokens, completion_tokens)
+            logger.info(f"Stream completed. Category: {category} | Model: {selected_model} -> {actual_model} | Tokens: {prompt_tokens}+{completion_tokens}")
         else:
             logger.info(f"Stream completed. Routed Category: {category} | Selected Model: {selected_model} -> Responded: {actual_model}")
 
@@ -925,16 +986,29 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
             response_json = r.json()
             response_json = sanitize_json(response_json)
             actual_model = response_json.get("model", actual_primary)
+
+            # Guard: never return a response with no choices to the client.
+            # Some upstream providers return 200 with an error body or empty choices,
+            # which crashes clients like Copilot ("Response contained no choices").
+            if not response_json.get("choices"):
+                err_msg = (response_json.get("error", {}) or {}).get("message") or "Upstream returned no choices"
+                logger.error(f"Upstream {actual_primary} returned 200 with no choices: {json.dumps(response_json)[:300]}")
+                raise HTTPException(status_code=502, detail=f"Upstream returned no choices: {err_msg}")
             
             # Map reasoning_content and XML tool calls in non-streaming responses
             if "choices" in response_json and response_json["choices"]:
                 message = response_json["choices"][0].get("message", {})
                 reasoning = message.get("reasoning_content") or message.get("reasoning")
                 content = message.get("content", "")
-                if reasoning and content:
-                    content = f"<think>\n{reasoning}\n</think>\n\n{content}"
-                elif reasoning:
-                    content = f"<think>\n{reasoning}\n</think>\n\n"
+                enable_thinking_mapping = config.get("routing", {}).get("enable_thinking_mapping", False)
+                if reasoning and enable_thinking_mapping:
+                    if content:
+                        content = "<thinking>\n" + reasoning + "\n</thinking>\n\n" + content
+                    else:
+                        content = "<thinking>\n" + reasoning + "\n</thinking>\n\n"
+                # Always strip raw reasoning fields so clients don't loop on them
+                message.pop("reasoning_content", None)
+                message.pop("reasoning", None)
                 
                 # Check for XML tool calls in content
                 if content and ("<invoke" in content or "<function_calls>" in content):
@@ -989,9 +1063,9 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
             usage = response_json.get("usage", {})
             prompt_tokens = usage.get("prompt_tokens", 0)
             completion_tokens = usage.get("completion_tokens", 0)
-            
-            print_transaction_summary(category, actual_primary, actual_model, prompt_tokens, completion_tokens)
-            
+
+            logger.info(f"Request completed. Category: {category} | Model: {actual_primary} -> {actual_model} | Tokens: {prompt_tokens}+{completion_tokens}")
+
             return JSONResponse(content=response_json)
         except HTTPException:
             raise
