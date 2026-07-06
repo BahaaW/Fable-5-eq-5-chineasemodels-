@@ -692,9 +692,18 @@ async def forward_request_with_failover(
                 err_msg = r.text
                 logger.warning(f"Model {model} failed on {PROVIDER} with code {r.status_code}: {err_msg}")
                 last_error = f"Status {r.status_code}: {err_msg}"
+        except httpx.TimeoutException as e:
+            logger.warning(f"Model {model} timed out on {PROVIDER}: {type(e).__name__}: {e}")
+            last_error = f"Timeout: {type(e).__name__}"
+        except httpx.ConnectError as e:
+            logger.warning(f"Model {model} connection failed on {PROVIDER}: {type(e).__name__}: {e}")
+            last_error = f"Connection error: {type(e).__name__}"
+        except httpx.HTTPError as e:
+            logger.warning(f"Model {model} HTTP error on {PROVIDER}: {type(e).__name__}: {e}")
+            last_error = f"HTTP error: {type(e).__name__}"
         except Exception as e:
-            logger.warning(f"Model {model} request failed with exception: {e}")
-            last_error = str(e)
+            logger.warning(f"Model {model} request failed with exception: {type(e).__name__}: {e}")
+            last_error = f"{type(e).__name__}: {e}"
             
     raise HTTPException(
         status_code=502,
