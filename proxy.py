@@ -12,6 +12,7 @@ cache_store = {}
 CACHE_TTL = 3600  # Cache duration: 1 hour
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response, HTTPException, Header
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
@@ -30,6 +31,49 @@ async def lifespan(app: FastAPI):
     await app.state.client.aclose()
 
 app = FastAPI(title="Chinese LLM Router Proxy", lifespan=lifespan)
+
+# Standard OpenAI-compliant error handlers so that client extensions decode error responses gracefully.
+@app.exception_handler(HTTPException)
+async def openai_http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": {
+                "message": exc.detail,
+                "type": "invalid_request_error",
+                "param": None,
+                "code": str(exc.status_code)
+            }
+        }
+    )
+
+@app.exception_handler(RequestValidationError)
+async def openai_validation_exception_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=400,
+        content={
+            "error": {
+                "message": f"Validation Error: {exc.errors()}",
+                "type": "invalid_request_error",
+                "param": None,
+                "code": "validation_error"
+            }
+        }
+    )
+
+@app.exception_handler(Exception)
+async def openai_general_exception_handler(request: Request, exc: Exception):
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": {
+                "message": f"Internal Server Error: {str(exc)}",
+                "type": "api_error",
+                "param": None,
+                "code": "internal_server_error"
+            }
+        }
+    )
 
 # Add CORS Middleware
 app.add_middleware(
@@ -389,6 +433,16 @@ def print_transaction_summary(category: str, selected_model: str, actual_model: 
     )
     print(summary)
 
+def get_http_client(request: Request) -> httpx.AsyncClient:
+    """Safely retrieves the connection pool client, falling back to a fresh one if lifespan was bypassed (e.g. in tests)."""
+    try:
+        return request.app.state.client
+    except AttributeError:
+        # For testing environments where lifespan events are not executed
+        if not hasattr(request.app.state, "_fallback_client"):
+            request.app.state._fallback_client = httpx.AsyncClient(timeout=180.0, http2=True)
+        return request.app.state._fallback_client
+
 @app.get("/v1/models")
 async def list_models(request: Request, authorization: Optional[str] = Header(None)):
     cache_key = ("GET", "v1/models", "")
@@ -402,6 +456,12 @@ async def list_models(request: Request, authorization: Optional[str] = Header(No
 
     virtual_models = [
         {"id": "custom-router", "object": "model", "owned_by": "custom"},
+        {"id": "gpt-4o", "object": "model", "owned_by": "openai"},
+        {"id": "gpt-4", "object": "model", "owned_by": "openai"},
+        {"id": "claude-3-5-sonnet", "object": "model", "owned_by": "anthropic"},
+        {"id": "claude-3-5-haiku", "object": "model", "owned_by": "anthropic"},
+        {"id": "deepseek-chat", "object": "model", "owned_by": "deepseek"},
+        {"id": "deepseek-reasoner", "object": "model", "owned_by": "deepseek"},
         {"id": "qwen/qwen3.7-max", "object": "model", "owned_by": "alibaba"},
         {"id": "deepseek/deepseek-v4-pro", "object": "model", "owned_by": "deepseek"},
         {"id": "z-ai/glm-5.2", "object": "model", "owned_by": "z-ai"},
@@ -413,7 +473,7 @@ async def list_models(request: Request, authorization: Optional[str] = Header(No
     if not api_base:
         api_base = "https://openrouter.ai/api/v1" if PROVIDER == "openrouter" else "https://opencode.ai/zen/go/v1"
 
-    client = request.app.state.client
+    client = get_http_client(request)
     headers = {}
     
     # Use global key or forwarded auth header if present
@@ -625,10 +685,14 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
     stream = body.get("stream", False)
     
     # Check if request targets auto-routing
-    should_route = requested_model in ["custom-router", "default", "qwen/qwen3.7-max", ""]
+    # Automatically routes custom-router, default, empty, or any standard model alias without a '/' slash (like gpt-4o, claude-3-5-sonnet, deepseek-chat)
+    should_route = (
+        requested_model in ["custom-router", "default", ""] or
+        "/" not in requested_model
+    )
     
     # Retrieve the pre-initialized global connection client (reuses TCP/SSL pool with HTTP/2 support)
-    client = request.app.state.client
+    client = get_http_client(request)
     
     if should_route:
         category = await determine_category(messages, api_key, client)
