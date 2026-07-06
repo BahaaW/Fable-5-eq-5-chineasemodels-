@@ -681,29 +681,62 @@ async def forward_request_with_failover(
         payload = sanitize_payload_for_model(payload, model)
             
         logger.info(f"Forwarding call to {PROVIDER} for model: {model}")
-        try:
-            req = client.build_request("POST", f"{api_base}/chat/completions", headers=headers, json=payload)
-            r = await client.send(req, stream=stream)
-            if r.status_code == 200:
-                return r, model
-            else:
-                if stream:
-                    await r.aread()
-                err_msg = r.text
-                logger.warning(f"Model {model} failed on {PROVIDER} with code {r.status_code}: {err_msg}")
-                last_error = f"Status {r.status_code}: {err_msg}"
-        except httpx.TimeoutException as e:
-            logger.warning(f"Model {model} timed out on {PROVIDER}: {type(e).__name__}: {e}")
-            last_error = f"Timeout: {type(e).__name__}"
-        except httpx.ConnectError as e:
-            logger.warning(f"Model {model} connection failed on {PROVIDER}: {type(e).__name__}: {e}")
-            last_error = f"Connection error: {type(e).__name__}"
-        except httpx.HTTPError as e:
-            logger.warning(f"Model {model} HTTP error on {PROVIDER}: {type(e).__name__}: {e}")
-            last_error = f"HTTP error: {type(e).__name__}"
-        except Exception as e:
-            logger.warning(f"Model {model} request failed with exception: {type(e).__name__}: {e}")
-            last_error = f"{type(e).__name__}: {e}"
+        max_retries = config.get("routing", {}).get("max_retries", 2)
+        for attempt in range(max_retries):
+            try:
+                req = client.build_request("POST", f"{api_base}/chat/completions", headers=headers, json=payload)
+                r = await client.send(req, stream=stream)
+                if r.status_code == 200:
+                    return r, model
+                else:
+                    if stream:
+                        await r.aread()
+                    err_msg = r.text
+                    # Retry on transient upstream errors (5xx, rate limits, generic upstream failures)
+                    is_transient = (
+                        r.status_code >= 500 or
+                        r.status_code == 429 or
+                        "Upstream request failed" in err_msg or
+                        "rate limit" in err_msg.lower() or
+                        "overloaded" in err_msg.lower()
+                    )
+                    if is_transient and attempt < max_retries - 1:
+                        wait = 2 ** attempt  # 1s, 2s backoff
+                        logger.warning(f"Model {model} transient error on {PROVIDER} (attempt {attempt+1}/{max_retries}), retrying in {wait}s: {err_msg[:200]}")
+                        import asyncio
+                        await asyncio.sleep(wait)
+                        continue
+                    logger.warning(f"Model {model} failed on {PROVIDER} with code {r.status_code}: {err_msg[:300]}")
+                    last_error = f"Status {r.status_code}: {err_msg[:200]}"
+                    break  # Non-transient or final attempt, move to next model
+            except httpx.TimeoutException as e:
+                if attempt < max_retries - 1:
+                    wait = 2 ** attempt
+                    logger.warning(f"Model {model} timed out on {PROVIDER} (attempt {attempt+1}/{max_retries}), retrying in {wait}s")
+                    import asyncio
+                    await asyncio.sleep(wait)
+                    continue
+                logger.warning(f"Model {model} timed out on {PROVIDER}: {type(e).__name__}: {e}")
+                last_error = f"Timeout: {type(e).__name__}"
+                break
+            except httpx.ConnectError as e:
+                if attempt < max_retries - 1:
+                    wait = 2 ** attempt
+                    logger.warning(f"Model {model} connection failed on {PROVIDER} (attempt {attempt+1}/{max_retries}), retrying in {wait}s")
+                    import asyncio
+                    await asyncio.sleep(wait)
+                    continue
+                logger.warning(f"Model {model} connection failed on {PROVIDER}: {type(e).__name__}: {e}")
+                last_error = f"Connection error: {type(e).__name__}"
+                break
+            except httpx.HTTPError as e:
+                logger.warning(f"Model {model} HTTP error on {PROVIDER}: {type(e).__name__}: {e}")
+                last_error = f"HTTP error: {type(e).__name__}"
+                break
+            except Exception as e:
+                logger.warning(f"Model {model} request failed with exception: {type(e).__name__}: {e}")
+                last_error = f"{type(e).__name__}: {e}"
+                break
             
     raise HTTPException(
         status_code=502,
@@ -873,6 +906,14 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
     messages = body.get("messages", [])
     requested_model = body.get("model", "")
     stream = body.get("stream", False)
+    
+    # Cap max_tokens to prevent "Response too long" errors in Copilot.
+    # Chinese models (especially DeepSeek with thinking) can generate very long responses
+    # that exceed Copilot's internal limits. Default cap: 16384 tokens.
+    max_tokens_cap = config.get("routing", {}).get("max_tokens_cap", 16384)
+    current_max_tokens = body.get("max_tokens")
+    if current_max_tokens is None or current_max_tokens > max_tokens_cap:
+        body["max_tokens"] = max_tokens_cap
     
     enable_system_reminder = config.get("routing", {}).get("enable_system_reminder", True)
     if enable_system_reminder:
