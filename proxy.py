@@ -366,7 +366,7 @@ async def classify_semantically(query: str, api_key: str, client: httpx.AsyncCli
     # Apply per-model parameter fixes (e.g. kimi temp/top_p restrictions)
     payload = sanitize_payload_for_model(payload, classifier_model)
 
-    classifier_timeout = config.get("routing", {}).get("classifier_timeout", 15.0)
+    classifier_timeout = config.get("routing", {}).get("classifier_timeout", 30.0)
     try:
         response = await client.post(f"{api_base}/chat/completions", headers=headers, json=payload, timeout=classifier_timeout)
         if response.status_code == 200:
