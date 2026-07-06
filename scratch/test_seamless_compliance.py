@@ -15,19 +15,25 @@ def test_openai_compliant_errors():
     print("Testing OpenAI compliant error handlers...")
     
     # 1. Trigger a 401 Unauthorized by providing an empty API key
-    # (Since there is no key set or provided, it should raise a 401 error)
-    response = client.post("/v1/chat/completions", json={
-        "model": "gpt-4o",
-        "messages": [{"role": "user", "content": "hi"}]
-    }, headers={"Authorization": "Bearer "}) # empty token
-    
-    assert response.status_code == 401
-    err_json = response.json()
-    assert "error" in err_json
-    assert err_json["error"]["type"] == "invalid_request_error"
-    assert err_json["error"]["code"] == "401"
-    assert "message" in err_json["error"]
-    print("Compliant 401 error handler passed!")
+    # (Mock ENV_API_KEY so the proxy raises a local 401 instead of using the config key)
+    import proxy
+    old_key = proxy.ENV_API_KEY
+    proxy.ENV_API_KEY = None
+    try:
+        response = client.post("/v1/chat/completions", json={
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hi"}]
+        }, headers={"Authorization": "Bearer "}) # empty token
+        
+        assert response.status_code == 401
+        err_json = response.json()
+        assert "error" in err_json
+        assert err_json["error"]["type"] == "invalid_request_error"
+        assert err_json["error"]["code"] == "401"
+        assert "message" in err_json["error"]
+        print("Compliant 401 error handler passed!")
+    finally:
+        proxy.ENV_API_KEY = old_key
 
     # 2. Trigger a 400 Validation Error by sending bad request payload format
     response_bad = client.post("/v1/chat/completions", content="invalid json")

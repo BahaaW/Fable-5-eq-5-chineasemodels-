@@ -123,11 +123,16 @@ logger.info(f"Loaded Router Provider: {PROVIDER}")
 
 def map_model_for_provider(model_id: str) -> str:
     if PROVIDER == "opencode":
-        if model_id.startswith("opencode-go/"):
-            return model_id
-        parts = model_id.split("/", 1)
-        model_name = parts[-1]
-        return f"opencode-go/{model_name}"
+        # Strip any provider prefix (like moonshotai/, qwen/, or opencode-go/)
+        model_name = model_id.split("/")[-1]
+        
+        # Specific model name translations to map OpenRouter names to OpenCode Go equivalents
+        translation_map = {
+            "qwen-2.5-72b-instruct": "qwen3.7-max",
+            "qwen-2.5-7b-instruct": "qwen3.5-plus",
+            "qwen-2.5-coder-32b-instruct": "qwen3.7-plus",
+        }
+        return translation_map.get(model_name, model_name)
     return model_id
 
 

@@ -1,5 +1,5 @@
 # Chinease-routers Primer
-- Current Phase: Seamless Compliance Completed
-- Completed: Automated configure_hermes.py, integrated SafeGZipMiddleware, XMLToJSONStreamParser, Prompt/Response Caching, OpenAI-compliant error formatting, and model alias routing.
-- Next Steps: Restart proxy.py and run benchmark tests.
+- Current Phase: Features Refined & Verified
+- Completed: Integrated XMLToJSONStreamParser with flexible regex, system reminder injection, SafeGZipMiddleware, Anti-Buffering headers, and 5-min timeout configurations.
+- Next Steps: Run live benchmarks.
 - Blockers: None
