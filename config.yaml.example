@@ -2,11 +2,11 @@ provider: "openrouter" # "openrouter" or "opencode"
 
 openrouter:
   api_base: "https://openrouter.ai/api/v1"
-  api_key: "" # Put your OpenRouter API key here (optional, falls back to environment variable)
+  api_key: "" # Keys are loaded from .env via python-dotenv (OPENROUTER_API_KEY). Leave empty.
 
 opencode:
   api_base: "https://opencode.ai/zen/go/v1"
-  api_key: "" # Put your OpenCode API key here (optional, falls back to environment variable)
+  api_key: "" # Keys are loaded from .env via python-dotenv (OPENCODE_API_KEY). Leave empty.
 
 routing:
   default_model: "qwen/qwen3.7-max"

@@ -238,6 +238,7 @@ def map_model_for_provider(model_id: str) -> str:
 
 
 # Load default API keys from config or environment
+# Precedence: config.yaml > .env file > system environment variables
 def get_env_api_key() -> Optional[str]:
     provider_config = config.get(PROVIDER)
     if isinstance(provider_config, dict):
