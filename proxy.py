@@ -10,6 +10,14 @@ import uuid
 import html
 from typing import Dict, List, Any, Optional, Generator, Tuple
 
+# Load .env file before anything else so env vars are available to config reads.
+try:
+    from dotenv import load_dotenv
+    _env_path = os.path.join(os.path.dirname(__file__), ".env")
+    load_dotenv(_env_path, override=False)
+except ImportError:
+    pass
+
 # In-memory lookup cache with sliding expiration
 cache_store = {}
 CACHE_TTL = 3600  # Cache duration: 1 hour
