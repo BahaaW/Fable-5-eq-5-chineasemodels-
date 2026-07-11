@@ -28,6 +28,14 @@ TEST_CASES = [
     {
         "name": "Reasoning & Math Task (Expected: minimax/minimax-m3)",
         "prompt": "A box contains 3 red balls and 7 blue balls. If we draw two balls without replacement, what is the probability that both are red? Show step-by-step mathematical reasoning."
+    },
+    {
+        "name": "Agentic / Tool-Use Task (Expected: moonshotai/kimi-k2.7-code)",
+        "prompt": "I need you to use the file_search tool to find all Python files in the src/ directory, then use the read_file tool to read the first one, and finally execute a grep on it."
+    },
+    {
+        "name": "General Knowledge Task (Expected: qwen/qwen3.7-max)",
+        "prompt": "Explain the difference between a black hole's event horizon and its singularity in simple terms."
     }
 ]
 

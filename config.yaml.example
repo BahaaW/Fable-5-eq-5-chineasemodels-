@@ -11,11 +11,16 @@ opencode:
 routing:
   default_model: "qwen/qwen3.7-max"
   classifier_model: "qwen/qwen-2.5-7b-instruct"
+  vision_model: "qwen/qwen3.7-max" # Model used when image content blocks are detected (must support vision)
+  max_tokens_cap: 28672 # Maximum tokens per response to prevent Copilot "Response too long" errors
+  classifier_timeout: 120 # Seconds before the semantic classifier falls back to "general"
   enable_semantic_classification: true # If false, uses regex rules only
   port: 8005
   enable_response_caching: true # Bypasses cost/time for identical requests
   enable_prompt_caching: true # Enforce KV caching for Claude models
   enable_system_reminder: true # Appends strict tool-calling reminders to the system prompt
+  enable_thinking_mapping: false # If true, wraps reasoning_content in <thinking> tags for clients that don't support it natively
+  max_retries: 2 # Max retry attempts per model before failing over to the next fallback
 
 # Pricing rates per million tokens in USD (approximate rates for cost reporting)
 pricing:

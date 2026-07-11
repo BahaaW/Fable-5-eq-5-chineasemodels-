@@ -4,31 +4,101 @@ import json
 import logging
 import re
 import time
+import copy
+import asyncio
+import uuid
 import html
 from typing import Dict, List, Any, Optional, Generator, Tuple
 
 # In-memory lookup cache with sliding expiration
 cache_store = {}
 CACHE_TTL = 3600  # Cache duration: 1 hour
+
+
+class RateLimiter:
+    """Simple sliding-window rate limiter for proxy endpoints."""
+    def __init__(self, max_requests: int = 120, window_seconds: int = 60):
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self._clients: Dict[str, List[float]] = {}
+
+    def is_allowed(self, client_ip: str) -> bool:
+        now = time.time()
+        window_start = now - self.window_seconds
+        if client_ip not in self._clients:
+            self._clients[client_ip] = []
+        self._clients[client_ip] = [t for t in self._clients[client_ip] if t > window_start]
+        if len(self._clients[client_ip]) >= self.max_requests:
+            return False
+        self._clients[client_ip].append(now)
+        return True
+
+    async def cleanup(self):
+        """Periodically prune stale client entries."""
+        while True:
+            await asyncio.sleep(600)
+            now = time.time()
+            stale = [ip for ip, times in self._clients.items() if not times or times[-1] < now - self.window_seconds]
+            for ip in stale:
+                del self._clients[ip]
+
+
+_rate_limiter = RateLimiter()
+
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response, HTTPException, Header
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import StreamingResponse, JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 import httpx
 import uvicorn
 
-# Configure logging to warning/error levels only
-logging.basicConfig(level=logging.WARNING, format="%(asctime)s - %(levelname)s - %(message)s")
+# Configure structured JSON logging for SIEM/aggregation compatibility
+class _JSONFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        entry: dict = {
+            "ts": self.formatTime(record),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+        if hasattr(record, "request_id"):
+            entry["rid"] = record.request_id
+        if record.exc_info and record.exc_info[1]:
+            entry["exc"] = str(record.exc_info[1])
+        return json.dumps(entry, default=str)
+
+
+_handler = logging.StreamHandler()
+_handler.setFormatter(_JSONFormatter())
 logger = logging.getLogger("ChineseRouter")
+logger.handlers.clear()
+logger.addHandler(_handler)
+logger.setLevel(logging.WARNING)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Enable HTTP/2 and set 5-minute timeout limit for connection pool reuse
     app.state.client = httpx.AsyncClient(timeout=300.0, http2=True)
+    # Background tasks: cache eviction and rate-limiter cleanup
+    cleanup_tasks = [
+        asyncio.create_task(_cache_eviction_loop()),
+        asyncio.create_task(_rate_limiter.cleanup()),
+    ]
     yield
+    for task in cleanup_tasks:
+        task.cancel()
     await app.state.client.aclose()
+
+
+async def _cache_eviction_loop():
+    """Evict expired cache entries every 5 minutes to prevent memory leaks."""
+    while True:
+        await asyncio.sleep(300)
+        now = time.time()
+        expired = [k for k, (_, ts) in list(cache_store.items()) if now - ts > CACHE_TTL]
+        for k in expired:
+            cache_store.pop(k, None)
 
 app = FastAPI(title="Chinese LLM Router Proxy", lifespan=lifespan)
 
@@ -75,14 +145,37 @@ async def openai_general_exception_handler(request: Request, exc: Exception):
         }
     )
 
-# Add CORS Middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# CORS Middleware — restricted to localhost/127.0.0.1 origins only.
+# allow_credentials=True is safe because origins are never wildcarded.
+@app.middleware("http")
+async def localhost_cors_middleware(request: Request, call_next):
+    origin = request.headers.get("origin", "")
+    is_localhost = bool(re.match(r"https?://(localhost|127\.0\.0\.1)(:\d+)?$", origin))
+
+    if request.method == "OPTIONS":
+        # Handle CORS preflight directly
+        resp = Response(status_code=200)
+    else:
+        resp = await call_next(request)
+
+    if origin and is_localhost:
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "*"
+        resp.headers["Access-Control-Max-Age"] = "86400"
+
+    return resp
+
+
+@app.middleware("http")
+async def add_request_id(request: Request, call_next):
+    """Inject a short request ID into every response for audit trail."""
+    request_id = str(uuid.uuid4())[:8]
+    request.state.request_id = request_id
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    return response
 
 # Custom Gzip Middleware that automatically bypasses LLM API routes.
 # Standard Gzip middleware buffers streaming responses (like SSE text/event-stream),
@@ -219,6 +312,8 @@ def map_chunk_tool_calls(chunk: dict, mapper: ToolCallIndexMapper) -> dict:
 
 class XMLToJSONStreamParser:
     """Parses streaming raw XML tool calls and repackages them as standard JSON tool_calls on the fly."""
+    MAX_BUFFER = 100_000  # Safety cap to prevent memory exhaustion from unbounded XML
+
     def __init__(self):
         self.buffer = ""
         self.in_xml_mode = False
@@ -227,6 +322,11 @@ class XMLToJSONStreamParser:
     def feed(self, text: str) -> List[dict]:
         """Feeds a text chunk and returns a list of OpenAI delta chunks (either content or tool_calls)."""
         self.buffer += text
+        if len(self.buffer) > self.MAX_BUFFER:
+            raise ValueError(
+                f"XMLToJSONStreamParser buffer overflow ({len(self.buffer)} > {self.MAX_BUFFER}). "
+                "The model is streaming malformed or unterminated XML tool calls."
+            )
         chunks = []
 
         while True:
@@ -315,21 +415,29 @@ class XMLToJSONStreamParser:
 
         return chunks
 
-def classify_by_keywords(text: str) -> Optional[str]:
-    """Classifies a query based on keyword counts defined in config.yaml."""
-    text_lower = text.lower()
-    scores = {}
-    
+# Pre-compiled keyword patterns for fast regex classification (built once at startup)
+_KEYWORD_PATTERNS: Dict[str, List[Tuple[str, re.Pattern]]] = {}
+
+def _build_keyword_patterns():
     for category, cat_data in config.get("categories", {}).items():
         if category == "general":
             continue
-        score = 0
+        patterns = []
         for keyword in cat_data.get("keywords", []):
-            pattern = r'\b' + re.escape(keyword) + r'\b'
-            score += len(re.findall(pattern, text_lower))
+            patterns.append((keyword, re.compile(r"\b" + re.escape(keyword) + r"\b")))
+        _KEYWORD_PATTERNS[category] = patterns
+
+_build_keyword_patterns()
+
+
+def classify_by_keywords(text: str) -> Optional[str]:
+    """Classifies a query based on keyword counts defined in config.yaml."""
+    text_lower = text.lower()
+    scores: dict = {}
+    for category, patterns in _KEYWORD_PATTERNS.items():
+        score = sum(len(pattern.findall(text_lower)) for _, pattern in patterns)
         if score > 0:
             scores[category] = score
-            
     if scores:
         best_cat = max(scores, key=scores.get)
         logger.info(f"Regex Keyword matches: {scores} -> Selected: {best_cat}")
@@ -425,22 +533,6 @@ async def determine_category(messages: List[Dict[str, Any]], api_key: Optional[s
         return await classify_semantically(text_to_classify, api_key, client)
         
     return "general"
-
-def calculate_estimated_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
-    pricing = config.get("pricing", {}).get(model)
-    if not pricing:
-        if model.startswith("opencode-go/"):
-            model_name = model.split("/", 1)[-1]
-            for key, val in config.get("pricing", {}).items():
-                if key.endswith(f"/{model_name}"):
-                    pricing = val
-                    break
-    if not pricing:
-        pricing = {"prompt": 0.5, "completion": 0.5}
-    
-    p_cost = (prompt_tokens / 1_000_000) * pricing.get("prompt", 0.5)
-    c_cost = (completion_tokens / 1_000_000) * pricing.get("completion", 0.5)
-    return p_cost + c_cost
 
 def get_http_client(request: Request) -> httpx.AsyncClient:
     """Safely retrieves the connection pool client, falling back to a fresh one if lifespan was bypassed (e.g. in tests)."""
@@ -568,7 +660,8 @@ def strip_unsupported_content_blocks(payload: dict, model_lower: str, allowed_ty
             new_messages.append(msg)
 
     if not changed:
-        return payload
+        # Always return a safe shallow copy — never leak the caller's original dict.
+        return payload.copy()
     payload = payload.copy()
     payload["messages"] = new_messages
     return payload
@@ -595,22 +688,25 @@ def sanitize_payload_for_model(payload: dict, model: str) -> dict:
 
     # DeepSeek thinking models: if reasoning_content is missing from history, disable thinking
     if "deepseek-v4-pro" in model_lower or "deepseek-v4" in model_lower:
+        # DeepSeek does not support image_url content blocks (only text).
+        # Strip image blocks and replace with a text placeholder so the request is accepted.
+        payload = strip_unsupported_content_blocks(payload, model_lower, allowed_types={"text"})
+
+        # Deep-copy AFTER strip_unsupported_content_blocks (which mutates in-place)
+        # so we never mutate the caller's original body dict.
+        payload = copy.deepcopy(payload)
+
         messages = payload.get("messages", [])
         has_reasoning = any(
             isinstance(m, dict) and m.get("role") == "assistant" and m.get("reasoning_content")
             for m in messages
         )
         if not has_reasoning:
-            payload = payload.copy()
             # Disable thinking mode so the API does not require reasoning_content echo-back.
             # DeepSeek expects `thinking` to be a ThinkingOptions struct, not a boolean,
             # so we use the object form {"type": "disabled"} and also set enable_thinking=false.
             payload["enable_thinking"] = False
             payload["thinking"] = {"type": "disabled"}
-
-        # DeepSeek does not support image_url content blocks (only text).
-        # Strip image blocks and replace with a text placeholder so the request is accepted.
-        payload = strip_unsupported_content_blocks(payload, model_lower, allowed_types={"text"})
 
     # MiniMax M3 is served via the Anthropic SDK, which enforces strict parameter
     # constraints that OpenAI/OpenRouter clients routinely violate:
@@ -619,18 +715,23 @@ def sanitize_payload_for_model(payload: dict, model: str) -> dict:
     #   - max_tokens is required (OpenAI clients sometimes omit it)
     # We clamp/patch these so the request is accepted.
     if "minimax-m3" in model_lower or "minimax/m3" in model_lower:
-        payload = payload.copy()
         temp = payload.get("temperature")
-        if isinstance(temp, (int, float)):
-            payload["temperature"] = max(0.0, min(1.0, float(temp)))
-        else:
-            payload["temperature"] = 1.0
         top_p = payload.get("top_p")
-        if isinstance(top_p, (int, float)):
-            payload["top_p"] = max(0.0, min(1.0, float(top_p)))
-        if not payload.get("max_tokens"):
-            # Anthropic SDK requires max_tokens; default to a sane cap.
-            payload["max_tokens"] = 4096
+        needs_clamp = (
+            (isinstance(temp, (int, float)) and (temp < 0 or temp > 1))
+            or (isinstance(top_p, (int, float)) and (top_p < 0 or top_p > 1))
+            or not payload.get("max_tokens")
+        )
+        if needs_clamp:
+            payload = payload.copy()
+            if isinstance(temp, (int, float)):
+                payload["temperature"] = max(0.0, min(1.0, float(temp)))
+            else:
+                payload["temperature"] = 1.0
+            if isinstance(top_p, (int, float)):
+                payload["top_p"] = max(0.0, min(1.0, float(top_p)))
+            if not payload.get("max_tokens"):
+                payload["max_tokens"] = 4096
 
     return payload
 
@@ -645,27 +746,56 @@ async def forward_request_with_failover(
 ) -> Tuple[httpx.Response, str]:
     """Forwards the request using native server fallbacks (OpenRouter) or client-side retry loop (OpenCode)."""
     if PROVIDER == "openrouter":
-        # OpenRouter supports native model list parameter
+        # OpenRouter supports native model list parameter and server-side failover,
+        # but we add client-side retries for transient errors (5xx, rate limits, timeouts).
         active_model = fallback_models[0]
         if not ("claude" in active_model.lower() or "anthropic" in active_model.lower()):
             body = body.copy()
             body["messages"] = strip_prompt_caching(body.get("messages", []))
-            
+
         body["model"] = active_model
         body["models"] = fallback_models
-
         body = sanitize_payload_for_model(body, active_model)
-        
-        req = client.build_request("POST", f"{api_base}/chat/completions", headers=headers, json=body)
-        r = await client.send(req, stream=stream)
-        if r.status_code != 200:
-            if not stream:
-                # Read response text for detailed error output
-                raise HTTPException(status_code=r.status_code, detail=f"OpenRouter API Error: {r.text}")
-            else:
-                await r.aread()
-                raise HTTPException(status_code=r.status_code, detail=f"OpenRouter Streaming Error: {r.text}")
-        return r, fallback_models[0]
+
+        max_retries = config.get("routing", {}).get("max_retries", 2)
+        last_error = ""
+        for attempt in range(max_retries):
+            try:
+                req = client.build_request("POST", f"{api_base}/chat/completions", headers=headers, json=body)
+                r = await client.send(req, stream=stream)
+                if r.status_code == 200:
+                    return r, fallback_models[0]
+                if stream:
+                    await r.aread()
+                err_msg = r.text
+                is_transient = (
+                    r.status_code >= 500
+                    or r.status_code == 429
+                    or "rate limit" in err_msg.lower()
+                    or "overloaded" in err_msg.lower()
+                )
+                if is_transient and attempt < max_retries - 1:
+                    wait = 2 ** attempt
+                    logger.warning(
+                        "OpenRouter transient error %d (attempt %d/%d), retrying in %ds: %s",
+                        r.status_code, attempt + 1, max_retries, wait, err_msg[:200],
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+                logger.error(
+                    "OpenRouter API Error %d: %s",
+                    r.status_code, err_msg[:300],
+                )
+                raise HTTPException(status_code=r.status_code, detail=f"OpenRouter API Error: {err_msg[:200]}")
+            except httpx.TimeoutException as e:
+                if attempt < max_retries - 1:
+                    wait = 2 ** attempt
+                    logger.warning("OpenRouter timeout (attempt %d/%d), retrying in %ds", attempt + 1, max_retries, wait)
+                    await asyncio.sleep(wait)
+                    continue
+                logger.error("OpenRouter timeout after %d attempts: %s", max_retries, e)
+                raise HTTPException(status_code=504, detail=f"OpenRouter timeout: {e}")
+        raise HTTPException(status_code=502, detail=f"OpenRouter all attempts failed: {last_error}")
         
     # OpenCode Go fallback loop (client-side failover)
     last_error = ""
@@ -702,39 +832,48 @@ async def forward_request_with_failover(
                     )
                     if is_transient and attempt < max_retries - 1:
                         wait = 2 ** attempt  # 1s, 2s backoff
-                        logger.warning(f"Model {model} transient error on {PROVIDER} (attempt {attempt+1}/{max_retries}), retrying in {wait}s: {err_msg[:200]}")
-                        import asyncio
+                        logger.warning(
+                            "Model %s transient error on %s (attempt %d/%d), retrying in %ds: %s",
+                            model, PROVIDER, attempt + 1, max_retries, wait, err_msg[:200],
+                        )
                         await asyncio.sleep(wait)
                         continue
-                    logger.warning(f"Model {model} failed on {PROVIDER} with code {r.status_code}: {err_msg[:300]}")
+                    logger.error(
+                        "Model %s failed on %s with code %d: %s",
+                        model, PROVIDER, r.status_code, err_msg[:300],
+                    )
                     last_error = f"Status {r.status_code}: {err_msg[:200]}"
                     break  # Non-transient or final attempt, move to next model
             except httpx.TimeoutException as e:
                 if attempt < max_retries - 1:
                     wait = 2 ** attempt
-                    logger.warning(f"Model {model} timed out on {PROVIDER} (attempt {attempt+1}/{max_retries}), retrying in {wait}s")
-                    import asyncio
+                    logger.warning(
+                        "Model %s timed out on %s (attempt %d/%d), retrying in %ds",
+                        model, PROVIDER, attempt + 1, max_retries, wait,
+                    )
                     await asyncio.sleep(wait)
                     continue
-                logger.warning(f"Model {model} timed out on {PROVIDER}: {type(e).__name__}: {e}")
+                logger.error("Model %s timed out on %s: %s", model, PROVIDER, e)
                 last_error = f"Timeout: {type(e).__name__}"
                 break
             except httpx.ConnectError as e:
                 if attempt < max_retries - 1:
                     wait = 2 ** attempt
-                    logger.warning(f"Model {model} connection failed on {PROVIDER} (attempt {attempt+1}/{max_retries}), retrying in {wait}s")
-                    import asyncio
+                    logger.warning(
+                        "Model %s connection failed on %s (attempt %d/%d), retrying in %ds",
+                        model, PROVIDER, attempt + 1, max_retries, wait,
+                    )
                     await asyncio.sleep(wait)
                     continue
-                logger.warning(f"Model {model} connection failed on {PROVIDER}: {type(e).__name__}: {e}")
+                logger.error("Model %s connection failed on %s: %s", model, PROVIDER, e)
                 last_error = f"Connection error: {type(e).__name__}"
                 break
             except httpx.HTTPError as e:
-                logger.warning(f"Model {model} HTTP error on {PROVIDER}: {type(e).__name__}: {e}")
+                logger.error("Model %s HTTP error on %s: %s", model, PROVIDER, e)
                 last_error = f"HTTP error: {type(e).__name__}"
                 break
             except Exception as e:
-                logger.warning(f"Model {model} request failed with exception: {type(e).__name__}: {e}")
+                logger.error("Model %s request failed with exception: %s", model, e)
                 last_error = f"{type(e).__name__}: {e}"
                 break
             
@@ -758,36 +897,42 @@ def inject_reminder(messages: List[dict]) -> List[dict]:
 
     new_messages = []
     system_updated = False
-    
-    # Try to find the system message and append the constraint
+
     for msg in messages:
-        new_msg = {k: v for k, v in msg.items()}
-        if new_msg.get("role") == "system" and not system_updated:
-            content = new_msg.get("content", "")
+        if msg.get("role") == "system" and not system_updated:
+            content = msg.get("content", "")
+            # Check if reminder is already present
+            already_has = False
             if isinstance(content, str):
-                if reminder_prefix not in content:
-                    new_msg["content"] = content + reminder_text
+                already_has = reminder_prefix in content
             elif isinstance(content, list):
-                # Append to the last text block or add a new one
-                already_has = False
                 for block in content:
                     if isinstance(block, dict) and block.get("type") == "text" and reminder_prefix in block.get("text", ""):
                         already_has = True
                         break
-                if not already_has:
-                    if content and isinstance(content[-1], dict) and content[-1].get("type") == "text":
-                        content[-1]["text"] = content[-1].get("text", "") + reminder_text
-                    else:
-                        content.append({"type": "text", "text": reminder_text})
-            system_updated = True
-        new_messages.append(new_msg)
 
-    # If no system message was found, prepend a new system message with the constraint
+            if not already_has:
+                new_msg = {k: v for k, v in msg.items()}
+                if isinstance(content, str):
+                    new_msg["content"] = content + reminder_text
+                elif isinstance(content, list):
+                    new_list = list(content)
+                    if new_list and isinstance(new_list[-1], dict) and new_list[-1].get("type") == "text":
+                        new_last = {k: v for k, v in new_list[-1].items()}
+                        new_last["text"] = new_last.get("text", "") + reminder_text
+                        new_list[-1] = new_last
+                    else:
+                        new_list.append({"type": "text", "text": reminder_text})
+                    new_msg["content"] = new_list
+                new_messages.append(new_msg)
+                system_updated = True
+                continue
+
+        system_updated = system_updated or msg.get("role") == "system"
+        new_messages.append(msg)  # Reuse original — no copy needed
+
     if not system_updated:
-        new_messages.insert(0, {
-            "role": "system",
-            "content": reminder_text.strip()
-        })
+        new_messages.insert(0, {"role": "system", "content": reminder_text.strip()})
 
     return new_messages
 
@@ -810,6 +955,7 @@ def add_cache_control_to_message(message: dict) -> dict:
         ]
     elif isinstance(content, list):
         # If it's already a list of blocks, add cache_control to the last block
+        # only if it doesn't already have one (prevents double-wrap on re-injection).
         if content:
             new_list = []
             for block in content:
@@ -817,8 +963,8 @@ def add_cache_control_to_message(message: dict) -> dict:
                     new_list.append({k: v for k, v in block.items()})
                 else:
                     new_list.append(block)
-            # Add cache_control to the last block
-            if isinstance(new_list[-1], dict):
+            # Only add cache_control if the last block doesn't already have it
+            if isinstance(new_list[-1], dict) and "cache_control" not in new_list[-1]:
                 new_list[-1]["cache_control"] = {"type": "ephemeral"}
             new_msg["content"] = new_list
             
@@ -837,14 +983,15 @@ def inject_prompt_caching(messages: List[dict]) -> List[dict]:
     # Set cache control breakpoints (up to 4 allowed by Anthropic):
     # 1. The system prompt (index 0 if role is 'system', otherwise the first user message)
     # 2. The message at index N-2 (usually the last assistant response, to cache the entire history prefix)
-    if new_messages[0].get("role") == "system":
-        new_messages[0] = add_cache_control_to_message(new_messages[0])
-    else:
-        new_messages[0] = add_cache_control_to_message(new_messages[0])
-        
+    # Always add cache breakpoint to message at index 0 (system or first user message).
+    new_messages[0] = add_cache_control_to_message(new_messages[0])
+
+    # Second breakpoint: message at index N-2.
+    # Only apply when there are >= 3 messages so it points to a DISTINCT message from index 0.
+    # With exactly 2 messages, N-2 == 0, so we'd re-apply to the same message (double-wrap bug).
     N = len(new_messages)
     if N >= 3:
-        new_messages[N-2] = add_cache_control_to_message(new_messages[N-2])
+        new_messages[N - 2] = add_cache_control_to_message(new_messages[N - 2])
         
     return new_messages
 
@@ -852,7 +999,16 @@ def strip_prompt_caching(messages: List[dict]) -> List[dict]:
     """Strips any cache_control annotations from message content blocks to avoid API errors on unsupported models."""
     if not messages:
         return messages
-    
+
+    # Fast path: bail out early if no message has cache_control blocks
+    if not any(
+        isinstance(m.get("content"), list)
+        and any(isinstance(b, dict) and "cache_control" in b for b in m["content"])
+        for m in messages
+        if isinstance(m, dict)
+    ):
+        return messages
+
     clean_messages = []
     for msg in messages:
         new_msg = {k: v for k, v in msg.items()}
@@ -896,6 +1052,14 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
         raise HTTPException(
             status_code=401,
             detail=f"API key not found. Please configure 'api_key' in config.yaml, set environment variables, or provide a valid key in the Authorization header."
+        )
+
+    # Rate limiting — protect against runaway agent loops burning through budget
+    client_ip = request.client.host if request.client else "unknown"
+    if not _rate_limiter.is_allowed(client_ip):
+        raise HTTPException(
+            status_code=429,
+            detail="Rate limit exceeded. Slow down — your API budget will thank you.",
         )
         
     try:
@@ -1123,7 +1287,12 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
             r, actual_primary = await forward_request_with_failover(
                 client, api_base, headers, body, fallback_models, stream=False
             )
-            response_json = r.json()
+            if r.status_code != 200:
+                raise HTTPException(status_code=r.status_code, detail=f"Upstream API error: {r.text[:300]}")
+            try:
+                response_json = r.json()
+            except Exception:
+                raise HTTPException(status_code=502, detail=f"Upstream returned non-JSON body: {r.text[:300]}")
             response_json = sanitize_json(response_json)
             actual_model = response_json.get("model", actual_primary)
 
