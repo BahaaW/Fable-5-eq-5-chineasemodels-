@@ -4,9 +4,9 @@ import json
 import logging
 import re
 import time
-import copy
 import asyncio
 import uuid
+import hashlib
 import html
 from typing import Dict, List, Any, Optional, Generator, Tuple
 
@@ -22,31 +22,47 @@ except ImportError:
 cache_store = {}
 CACHE_TTL = 3600  # Cache duration: 1 hour
 
+# Classifier result cache — avoids redundant LLM calls for identical/similar queries.
+# Keyed by SHA-256 of the classification text. TTL: 5 minutes.
+_classifier_cache: Dict[str, Tuple[str, float]] = {}
+_CLASSIFIER_CACHE_TTL = 300  # 5 minutes
+
 
 class RateLimiter:
-    """Simple sliding-window rate limiter for proxy endpoints."""
+    """Sliding-window rate limiter using (oldest_timestamp, count) tuples — O(1) per check.
+
+    Instead of maintaining a list of timestamps and rebuilding it on every call
+    (O(n) list allocation), track (oldest_timestamp, count). When the window slides
+    past oldest, reset. A single integer comparison replaces list filtering.
+    """
     def __init__(self, max_requests: int = 120, window_seconds: int = 60):
         self.max_requests = max_requests
         self.window_seconds = window_seconds
-        self._clients: Dict[str, List[float]] = {}
+        self._clients: Dict[str, Tuple[float, int]] = {}
 
     def is_allowed(self, client_ip: str) -> bool:
         now = time.time()
-        window_start = now - self.window_seconds
-        if client_ip not in self._clients:
-            self._clients[client_ip] = []
-        self._clients[client_ip] = [t for t in self._clients[client_ip] if t > window_start]
-        if len(self._clients[client_ip]) >= self.max_requests:
-            return False
-        self._clients[client_ip].append(now)
+        cutoff = now - self.window_seconds
+        entry = self._clients.get(client_ip)
+        if entry is not None:
+            oldest, count = entry
+            if oldest > cutoff:
+                if count >= self.max_requests:
+                    return False
+                self._clients[client_ip] = (oldest, count + 1)
+            else:
+                self._clients[client_ip] = (now, 1)
+        else:
+            self._clients[client_ip] = (now, 1)
         return True
 
     async def cleanup(self):
-        """Periodically prune stale client entries."""
+        """Periodically prune stale client entries (2x window to avoid premature eviction)."""
         while True:
             await asyncio.sleep(600)
             now = time.time()
-            stale = [ip for ip, times in self._clients.items() if not times or times[-1] < now - self.window_seconds]
+            stale_cutoff = now - (self.window_seconds * 2)
+            stale = [ip for ip, (t, _) in self._clients.items() if t < stale_cutoff]
             for ip in stale:
                 del self._clients[ip]
 
@@ -86,8 +102,13 @@ logger.setLevel(logging.WARNING)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Enable HTTP/2 and set 5-minute timeout limit for connection pool reuse
-    app.state.client = httpx.AsyncClient(timeout=300.0, http2=True)
+    # Split timeouts: fast connect/write/pool (10s), generous read (300s) for SSE streaming.
+    # During tool execution the upstream may not send chunks for minutes — a monolithic
+    # 300s timeout would make connect hangs last 5 minutes instead of 10 seconds.
+    app.state.client = httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=10.0, read=300.0, write=10.0, pool=10.0),
+        http2=True,
+    )
     # Background tasks: cache eviction and rate-limiter cleanup
     cleanup_tasks = [
         asyncio.create_task(_cache_eviction_loop()),
@@ -104,53 +125,51 @@ async def _cache_eviction_loop():
     while True:
         await asyncio.sleep(300)
         now = time.time()
+        # Main response cache
         expired = [k for k, (_, ts) in list(cache_store.items()) if now - ts > CACHE_TTL]
         for k in expired:
             cache_store.pop(k, None)
+        # Classifier cache
+        expired_cls = [k for k, (_, ts) in _classifier_cache.items() if now - ts > _CLASSIFIER_CACHE_TTL]
+        for k in expired_cls:
+            _classifier_cache.pop(k, None)
 
 app = FastAPI(title="Chinese LLM Router Proxy", lifespan=lifespan)
 
 # Standard OpenAI-compliant error handlers so that client extensions decode error responses gracefully.
+# All error responses carry Connection: close to prevent connection-reuse issues
+# when the upstream returns malformed chunks or the request fails mid-stream.
+
+def _error_response(status_code: int, content: dict) -> JSONResponse:
+    """Helper: builds an error response with Connection: close header."""
+    return JSONResponse(
+        status_code=status_code,
+        content=content,
+        headers={"Connection": "close"},
+    )
+
+
 @app.exception_handler(HTTPException)
 async def openai_http_exception_handler(request: Request, exc: HTTPException):
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={
-            "error": {
-                "message": exc.detail,
-                "type": "invalid_request_error",
-                "param": None,
-                "code": str(exc.status_code)
-            }
-        }
+    return _error_response(
+        exc.status_code,
+        {"error": {"message": exc.detail, "type": "invalid_request_error", "param": None, "code": str(exc.status_code)}},
     )
+
 
 @app.exception_handler(RequestValidationError)
 async def openai_validation_exception_handler(request: Request, exc: RequestValidationError):
-    return JSONResponse(
-        status_code=400,
-        content={
-            "error": {
-                "message": f"Validation Error: {exc.errors()}",
-                "type": "invalid_request_error",
-                "param": None,
-                "code": "validation_error"
-            }
-        }
+    return _error_response(
+        400,
+        {"error": {"message": f"Validation Error: {exc.errors()}", "type": "invalid_request_error", "param": None, "code": "validation_error"}},
     )
+
 
 @app.exception_handler(Exception)
 async def openai_general_exception_handler(request: Request, exc: Exception):
-    return JSONResponse(
-        status_code=500,
-        content={
-            "error": {
-                "message": f"Internal Server Error: {str(exc)}",
-                "type": "api_error",
-                "param": None,
-                "code": "internal_server_error"
-            }
-        }
+    return _error_response(
+        500,
+        {"error": {"message": f"Internal Server Error: {str(exc)}", "type": "api_error", "param": None, "code": "internal_server_error"}},
     )
 
 # CORS Middleware — restricted to localhost/127.0.0.1 origins only.
@@ -319,6 +338,74 @@ def map_chunk_tool_calls(chunk: dict, mapper: ToolCallIndexMapper) -> dict:
                             tool_call["index"] = mapped_idx
     return chunk
 
+# ---------------------------------------------------------------------------
+# Shared XML → tool_call parsing (used by both streaming and non-streaming paths)
+# ---------------------------------------------------------------------------
+
+_INVOKE_RE = re.compile(
+    r'<invoke\s+name\s*=\s*["\']([^"\']+)["\']\s*>(.*?)</invoke>', re.DOTALL
+)
+_PARAM_RE = re.compile(r'<([a-zA-Z0-9_]+)>(.*?)</\1>', re.DOTALL)
+
+
+def _coerce_param_value(raw: str) -> Any:
+    """Coerce a raw XML parameter string to bool, int, float, JSON, or plain str."""
+    val = html.unescape(raw.strip())
+    low = val.lower()
+    if low == "true":
+        return True
+    if low == "false":
+        return False
+    # Try int (no decimal), then float, then JSON, then raw string.
+    if "." in val:
+        try:
+            return float(val)
+        except ValueError:
+            pass
+    else:
+        try:
+            return int(val)
+        except ValueError:
+            pass
+    try:
+        return json.loads(val)
+    except (json.JSONDecodeError, TypeError):
+        return val
+
+
+def _parse_xml_invoke_params(inner_xml: str) -> Dict[str, Any]:
+    """Parse `<param>value</param>` pairs from an <invoke> body.
+
+    Returns a dict ready for json.dumps() into the tool_call arguments field.
+    """
+    params: Dict[str, Any] = {}
+    for param_name, param_val in _PARAM_RE.findall(inner_xml):
+        params[param_name] = _coerce_param_value(param_val)
+    return params
+
+
+def _build_tool_call_from_xml(
+    tool_name: str, params: Dict[str, Any], index: int
+) -> dict:
+    """Build a single OpenAI-compliant tool_call delta dict from parsed XML."""
+    return {
+        "index": index,
+        "id": f"call_xml_{index}",
+        "type": "function",
+        "function": {
+            "name": tool_name,
+            "arguments": json.dumps(params),
+        },
+    }
+
+
+def _strip_xml_tags(text: str) -> str:
+    """Remove <function_calls> and <invoke> XML blocks from a string."""
+    text = re.sub(r"<function_calls>.*?</function_calls>", "", text, flags=re.DOTALL)
+    text = re.sub(r"<invoke.*?</invoke>", "", text, flags=re.DOTALL)
+    return text.strip()
+
+
 class XMLToJSONStreamParser:
     """Parses streaming raw XML tool calls and repackages them as standard JSON tool_calls on the fly."""
     MAX_BUFFER = 100_000  # Safety cap to prevent memory exhaustion from unbounded XML
@@ -362,46 +449,12 @@ class XMLToJSONStreamParser:
             else:
                 # We are in XML mode. Look for closed invoke tags.
                 # Find all complete invoke blocks
-                match = re.search(r'<invoke\s+name\s*=\s*["\']([^"\']+)["\']\s*>(.*?)</invoke>', self.buffer, re.DOTALL)
+                match = _INVOKE_RE.search(self.buffer)
                 if match:
                     tool_name = match.group(1)
                     inner_xml = match.group(2)
-                    
-                    # Extract parameters
-                    params = re.findall(r'<([a-zA-Z0-9_]+)>(.*?)</\1>', inner_xml, re.DOTALL)
-                    params_dict = {}
-                    for param_name, param_val in params:
-                        # Clean up value and unescape XML entities
-                        clean_val = html.unescape(param_val.strip())
-                        # Attempt to parse numbers/booleans/JSON arrays/dicts if applicable, otherwise keep as string
-                        if clean_val.lower() == "true":
-                            params_dict[param_name] = True
-                        elif clean_val.lower() == "false":
-                            params_dict[param_name] = False
-                        else:
-                            try:
-                                # Try parsing as number
-                                if "." in clean_val:
-                                    params_dict[param_name] = float(clean_val)
-                                else:
-                                    params_dict[param_name] = int(clean_val)
-                            except ValueError:
-                                try:
-                                    # Try parsing as JSON array/object
-                                    params_dict[param_name] = json.loads(clean_val)
-                                except Exception:
-                                    params_dict[param_name] = clean_val
-                    
-                    # Create tool call dict
-                    tool_call = {
-                        "index": self.tool_call_index,
-                        "id": f"call_xml_{self.tool_call_index}",
-                        "type": "function",
-                        "function": {
-                            "name": tool_name,
-                            "arguments": json.dumps(params_dict)
-                        }
-                    }
+                    params_dict = _parse_xml_invoke_params(inner_xml)
+                    tool_call = _build_tool_call_from_xml(tool_name, params_dict, self.tool_call_index)
                     self.tool_call_index += 1
                     
                     chunks.append({"tool_calls": [tool_call]})
@@ -424,17 +477,22 @@ class XMLToJSONStreamParser:
 
         return chunks
 
-# Pre-compiled keyword patterns for fast regex classification (built once at startup)
-_KEYWORD_PATTERNS: Dict[str, List[Tuple[str, re.Pattern]]] = {}
+# Pre-compiled keyword patterns for fast regex classification (built once at startup).
+# Each category gets a single combined regex (alternation) instead of N individual
+# patterns, so classification scans the text once per category instead of once per keyword.
+_KEYWORD_PATTERNS: Dict[str, re.Pattern] = {}
 
 def _build_keyword_patterns():
     for category, cat_data in config.get("categories", {}).items():
         if category == "general":
             continue
-        patterns = []
-        for keyword in cat_data.get("keywords", []):
-            patterns.append((keyword, re.compile(r"\b" + re.escape(keyword) + r"\b")))
-        _KEYWORD_PATTERNS[category] = patterns
+        keywords = cat_data.get("keywords", [])
+        if not keywords:
+            continue
+        # Combine all keywords into one alternation pattern with word boundaries.
+        escaped = (re.escape(kw) for kw in keywords)
+        combined = r"\b(?:" + "|".join(escaped) + r")\b"
+        _KEYWORD_PATTERNS[category] = re.compile(combined)
 
 _build_keyword_patterns()
 
@@ -443,8 +501,8 @@ def classify_by_keywords(text: str) -> Optional[str]:
     """Classifies a query based on keyword counts defined in config.yaml."""
     text_lower = text.lower()
     scores: dict = {}
-    for category, patterns in _KEYWORD_PATTERNS.items():
-        score = sum(len(pattern.findall(text_lower)) for _, pattern in patterns)
+    for category, pattern in _KEYWORD_PATTERNS.items():
+        score = len(pattern.findall(text_lower))
         if score > 0:
             scores[category] = score
     if scores:
@@ -455,15 +513,29 @@ def classify_by_keywords(text: str) -> Optional[str]:
 
 async def classify_semantically(query: str, api_key: str, client: httpx.AsyncClient) -> str:
     """Classifies a query using a cheap LLM via the active provider."""
+    # Check classifier cache first — skip the LLM call for recently-seen queries.
+    cache_key = hashlib.sha256(query.encode("utf-8", errors="replace")).hexdigest()
+    cached = _classifier_cache.get(cache_key)
+    if cached:
+        cached_cat, cached_ts = cached
+        if time.time() - cached_ts < _CLASSIFIER_CACHE_TTL:
+            logger.info(f"LLM Classifier cache hit: '{cached_cat}'")
+            return cached_cat
+        else:
+            del _classifier_cache[cache_key]
+
     classifier_model = config.get("routing", {}).get("classifier_model", "qwen/qwen-2.5-7b-instruct")
     api_base = config.get(PROVIDER, {}).get("api_base")
     if not api_base:
         api_base = "https://openrouter.ai/api/v1" if PROVIDER == "openrouter" else "https://opencode.ai/zen/go/v1"
         
+    # Use JSON-formatted query to prevent prompt injection via embedded quotes or
+    # newlines in user input that could break out of the classifier instruction.
+    safe_query = json.dumps(query)
     prompt = (
         "You are a task classifier. Classify the user query into exactly one of these categories: "
         "'coding', 'design', 'agents', 'reasoning', or 'general'.\n"
-        f"Query: \"{query}\"\n"
+        f"Query: {safe_query}\n"
         "Category (respond with ONLY the single lowercase category word, no explanation, no markdown):"
     )
     
@@ -501,6 +573,7 @@ async def classify_semantically(query: str, api_key: str, client: httpx.AsyncCli
             cat = re.sub(r'[^\w]', '', cat)
             if cat in config.get("categories", {}):
                 logger.info(f"LLM Classifier selected: '{cat}'")
+                _classifier_cache[cache_key] = (cat, time.time())
                 return cat
             else:
                 logger.warning(f"LLM Classifier returned invalid category: '{cat}'")
@@ -550,7 +623,10 @@ def get_http_client(request: Request) -> httpx.AsyncClient:
     except AttributeError:
         # For testing environments where lifespan events are not executed
         if not hasattr(request.app.state, "_fallback_client"):
-            request.app.state._fallback_client = httpx.AsyncClient(timeout=300.0, http2=True)
+            request.app.state._fallback_client = httpx.AsyncClient(
+                timeout=httpx.Timeout(connect=10.0, read=300.0, write=10.0, pool=10.0),
+                http2=True,
+            )
         return request.app.state._fallback_client
 
 @app.get("/v1/models")
@@ -616,16 +692,18 @@ async def list_models(request: Request, authorization: Optional[str] = Header(No
     result = {"object": "list", "data": virtual_models}
     return JSONResponse(content=result)
 
-def strip_unsupported_content_blocks(payload: dict, model_lower: str, allowed_types: set) -> dict:
-    """Remove content blocks whose type is not in allowed_types for a given model.
+def strip_unsupported_content_blocks(payload: dict, allowed_types: set) -> dict:
+    """Remove content blocks whose type is not in allowed_types.
     
     Some providers (e.g. DeepSeek) only accept `text` content blocks and reject
     `image_url` / `image` blocks with a 400. We strip unsupported blocks and
     insert a text placeholder so the model knows an image was present.
+    
+    Always returns a fresh dict (never mutates the caller's payload).
     """
     messages = payload.get("messages", [])
     if not messages:
-        return payload
+        return payload.copy()
 
     changed = False
     new_messages = []
@@ -699,11 +777,9 @@ def sanitize_payload_for_model(payload: dict, model: str) -> dict:
     if "deepseek-v4-pro" in model_lower or "deepseek-v4" in model_lower:
         # DeepSeek does not support image_url content blocks (only text).
         # Strip image blocks and replace with a text placeholder so the request is accepted.
-        payload = strip_unsupported_content_blocks(payload, model_lower, allowed_types={"text"})
-
-        # Deep-copy AFTER strip_unsupported_content_blocks (which mutates in-place)
-        # so we never mutate the caller's original body dict.
-        payload = copy.deepcopy(payload)
+        # strip_unsupported_content_blocks always returns a fresh dict, so no extra
+        # copy is needed before mutating top-level keys below.
+        payload = strip_unsupported_content_blocks(payload, allowed_types={"text"})
 
         messages = payload.get("messages", [])
         has_reasoning = any(
@@ -758,8 +834,9 @@ async def forward_request_with_failover(
         # OpenRouter supports native model list parameter and server-side failover,
         # but we add client-side retries for transient errors (5xx, rate limits, timeouts).
         active_model = fallback_models[0]
+        # Always copy the body to avoid mutating the caller's dict (critical for retry loops).
+        body = body.copy()
         if not ("claude" in active_model.lower() or "anthropic" in active_model.lower()):
-            body = body.copy()
             body["messages"] = strip_prompt_caching(body.get("messages", []))
 
         body["model"] = active_model
@@ -1048,6 +1125,15 @@ def strip_prompt_caching(messages: List[dict]) -> List[dict]:
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request, authorization: Optional[str] = Header(None)):
+    # Hard cap on request body size (10 MB) to prevent memory exhaustion attacks.
+    # Legitimate chat requests rarely exceed 1 MB even with long conversation history.
+    content_length = request.headers.get("content-length")
+    if content_length and int(content_length) > 10_485_760:  # 10 MiB
+        raise HTTPException(
+            status_code=413,
+            detail="Request body too large. Maximum allowed size is 10 MB.",
+        )
+
     # 1. Use the server-configured key (from config.yaml or env) first
     api_key = ENV_API_KEY
     
@@ -1088,21 +1174,16 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
     if current_max_tokens is None or current_max_tokens > max_tokens_cap:
         body["max_tokens"] = max_tokens_cap
     
-    enable_system_reminder = config.get("routing", {}).get("enable_system_reminder", True)
-    if enable_system_reminder:
-        messages = inject_reminder(messages)
-        body["messages"] = messages
-    
     # Check if request targets auto-routing
     # Automatically routes custom-router, default, empty, or any standard model alias without a '/' slash (like gpt-4o, claude-3-5-sonnet, deepseek-chat)
     should_route = (
         requested_model in ["custom-router", "default", ""] or
         "/" not in requested_model
     )
-    
+
     # Retrieve the pre-initialized global connection client (reuses TCP/SSL pool with HTTP/2 support)
     client = get_http_client(request)
-    
+
     if should_route:
         # Image detection: if the conversation contains image content blocks,
         # route to a vision-capable model (qwen3.7-max) regardless of category,
@@ -1114,11 +1195,20 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
             fallback_models = [vision_model, config["routing"]["default_model"]]
             logger.info(f"Image content detected -> routing to vision model: {vision_model}")
         else:
+            # Classify on ORIGINAL messages before any injections (reminder, prompt caching)
+            # to prevent classifier pollution from injected boilerplate text.
             category = await determine_category(messages, api_key, client)
             cat_config = config.get("categories", {}).get(category, {})
             primary_model = cat_config.get("primary", config["routing"]["default_model"])
             fallback_models = cat_config.get("fallbacks", [primary_model])
-    else:
+
+    # Inject system reminder AFTER classification so it doesn't pollute routing.
+    enable_system_reminder = config.get("routing", {}).get("enable_system_reminder", True)
+    if enable_system_reminder:
+        messages = inject_reminder(messages)
+        body["messages"] = messages
+
+    if not should_route:
         category = "explicit"
         primary_model = requested_model
         matched_cat = next((cat for cat, data in config.get("categories", {}).items() if data.get("primary") == requested_model), None)
@@ -1131,7 +1221,7 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
     # (even Qwen-VL lineage). Strip image blocks and replace with a text placeholder
     # so the request is accepted instead of 400-ing with "Unexpected item type in content."
     if PROVIDER == "opencode" and messages_contain_images(body.get("messages", [])):
-        stripped = strip_unsupported_content_blocks({"messages": body.get("messages", [])}, "all", {"text"})
+        stripped = strip_unsupported_content_blocks({"messages": body.get("messages", [])}, {"text"})
         body = body.copy()
         body["messages"] = stripped["messages"]
         logger.info("Stripped image content blocks (OpenCode gateway does not support image passthrough).")
@@ -1331,50 +1421,15 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
                 # Check for XML tool calls in content
                 if content and ("<invoke" in content or "<function_calls>" in content):
                     tool_calls = []
-                    # Find all invoke blocks
-                    invokes = re.finditer(r'<invoke\s+name="([^"]+)"\s*>(.*?)</invoke>', content, re.DOTALL)
-                    tool_call_index = 0
-                    for match in invokes:
+                    for idx, match in enumerate(_INVOKE_RE.finditer(content)):
                         tool_name = match.group(1)
                         inner_xml = match.group(2)
-                        
-                        # Extract parameters
-                        params = re.findall(r'<([a-zA-Z0-9_]+)>(.*?)</\1>', inner_xml, re.DOTALL)
-                        params_dict = {}
-                        for param_name, param_val in params:
-                            clean_val = html.unescape(param_val.strip())
-                            if clean_val.lower() == "true":
-                                params_dict[param_name] = True
-                            elif clean_val.lower() == "false":
-                                params_dict[param_name] = False
-                            else:
-                                try:
-                                    if "." in clean_val:
-                                        params_dict[param_name] = float(clean_val)
-                                    else:
-                                        params_dict[param_name] = int(clean_val)
-                                except ValueError:
-                                    try:
-                                        params_dict[param_name] = json.loads(clean_val)
-                                    except Exception:
-                                        params_dict[param_name] = clean_val
-                        
-                        tool_calls.append({
-                            "id": f"call_xml_{tool_call_index}",
-                            "type": "function",
-                            "function": {
-                                "name": tool_name,
-                                "arguments": json.dumps(params_dict)
-                            }
-                        })
-                        tool_call_index += 1
+                        params_dict = _parse_xml_invoke_params(inner_xml)
+                        tool_calls.append(_build_tool_call_from_xml(tool_name, params_dict, idx))
                     
                     if tool_calls:
                         message["tool_calls"] = tool_calls
-                        # Remove the XML block from content
-                        clean_content = re.sub(r'<function_calls>.*?</function_calls>', '', content, flags=re.DOTALL)
-                        clean_content = re.sub(r'<invoke.*?</invoke>', '', clean_content, flags=re.DOTALL)
-                        content = clean_content.strip()
+                        content = _strip_xml_tags(content)
                 
                 message["content"] = content or None
                     
@@ -1400,4 +1455,29 @@ if __name__ == "__main__":
         logger.warning(f"Could not automatically configure Hermes config: {e}")
         
     logger.info(f"Starting Chinese LLM Router Proxy on port {PORT}...")
-    uvicorn.run(app, host="127.0.0.1", port=PORT)
+    import signal
+    import sys
+
+    config = uvicorn.Config(app, host="127.0.0.1", port=PORT, log_level="warning")
+    server = uvicorn.Server(config)
+
+    async def _shutdown(sig: int):
+        logger.info(f"Received signal {sig}, shutting down gracefully...")
+        server.should_exit = True
+        # Give background tasks a moment to finish
+        await asyncio.sleep(0.5)
+
+    loop = asyncio.new_event_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, lambda s=sig: asyncio.ensure_future(_shutdown(s), loop=loop))
+        except NotImplementedError:
+            pass  # Windows doesn't support add_signal_handler for SIGTERM
+
+    try:
+        loop.run_until_complete(server.serve())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.close()
