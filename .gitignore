@@ -3,3 +3,6 @@ __pycache__/
 graphify-out/
 .claude/settings.local.json
 .env
+wiki/
+.DS_Store
+Thumbs.db
